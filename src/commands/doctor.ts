@@ -1,5 +1,7 @@
 import { access, constants } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+
+import { config as loadDotenv } from "dotenv";
 
 import { loadConfig } from "../config/load.js";
 
@@ -30,6 +32,12 @@ export async function doctorProject(
   });
 
   const loaded = await loadConfig(path);
+  loadDotenv({
+    path: join(dirname(loaded.path), ".env"),
+    processEnv: env,
+    override: false,
+    quiet: true
+  });
   checks.push({ name: "Configuration", status: "pass", message: loaded.path });
   checks.push({ name: "Schema", status: "pass", message: "version " + loaded.config.version });
 

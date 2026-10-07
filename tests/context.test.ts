@@ -50,6 +50,43 @@ describe("context budgeting", () => {
     expect(context.events.map((event) => event.type)).toEqual(["tool_call", "tool_result"]);
   });
 
+  test("never retains an incomplete tool call/result pair", () => {
+    const call: AgentEvent = {
+      type: "tool_call",
+      id: "call-1",
+      name: "read_file",
+      arguments: { path: "src/a.ts" },
+      step: 1
+    };
+    const result: AgentEvent = {
+      type: "tool_result",
+      callId: "call-1",
+      name: "read_file",
+      content: "a".repeat(2_000),
+      ok: true,
+      step: 1
+    };
+    const budgetThatFitsOnlyTheCall = estimateTokens("inspect") + estimateTokens(call) + 2;
+
+    const context = buildContext("inspect", [call, result], budgetThatFitsOnlyTheCall);
+
+    expect(context.events).toEqual([]);
+    expect(context.truncated).toBe(true);
+  });
+
+  test("drops orphaned tool protocol events instead of serializing invalid history", () => {
+    const context = buildContext("inspect", [
+      { type: "tool_call", id: "orphan-call", name: "read_file", arguments: { path: "a.ts" }, step: 1 },
+      { type: "tool_result", callId: "orphan-result", name: "read_file", content: "result", ok: true, step: 2 },
+      { type: "assistant_text", content: "latest safe event", step: 3 }
+    ], 200);
+
+    expect(context.events).toEqual([
+      { type: "assistant_text", content: "latest safe event", step: 3 }
+    ]);
+    expect(context.truncated).toBe(true);
+  });
+
   test("still returns bounded context for a tiny positive budget", () => {
     const context = buildContext("a very long goal ".repeat(100), [
       { type: "assistant_text", content: "latest ".repeat(100), step: 1 }

@@ -73,10 +73,18 @@ class QueueWorkerClient implements WorkerClient {
 
 class FakeTools implements ToolExecutorLike {
   readonly calls: Array<{ call: ToolCall; context: ToolExecutionContext }> = [];
+  readonly #resultContent: string;
+
+  constructor(resultContent = "") {
+    this.#resultContent = resultContent;
+  }
 
   async execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionResult> {
     this.calls.push({ call, context });
-    return { ok: true, content: call.name === "read_file" ? "export const value = 1;" : "ok" };
+    return {
+      ok: true,
+      content: this.#resultContent || (call.name === "read_file" ? "export const value = 1;" : "ok")
+    };
   }
 }
 
@@ -92,16 +100,21 @@ function result(text = "", toolCalls: ToolCall[] = []): WorkerResult {
   return { text, toolCalls, usage: { inputTokens: 20, outputTokens: 5 }, finishReason: toolCalls.length ? "tool_calls" : "stop" };
 }
 
-function makeRunner(decisions: Array<RawRouteDecision | Error>, workers: Array<WorkerResult | Error>) {
+function makeRunner(
+  decisions: Array<RawRouteDecision | Error>,
+  workers: Array<WorkerResult | Error>,
+  options: { secrets?: string[]; toolResult?: string } = {}
+) {
   const decisionClient = new QueueDecisionClient(decisions);
   const workerClient = new QueueWorkerClient(workers);
-  const tools = new FakeTools();
+  const tools = new FakeTools(options.toolResult);
   const receipts = new MemoryReceipts();
   const runner = new HarnessRunner(testConfig(), {
     decisionClient,
     workerClient,
     toolExecutor: tools,
     receipts,
+    secrets: options.secrets,
     createRunId: () => "run-test",
     now: (() => {
       let time = 1_000;
@@ -242,6 +255,41 @@ describe("HarnessRunner", () => {
     ]);
   });
 
+  test("turns an unexpected tool executor rejection into a failed result and lets Jev recover", async () => {
+    const tools: ToolExecutorLike = {
+      async execute() {
+        throw new Error("tool adapter crashed");
+      }
+    };
+    const receipts = new MemoryReceipts();
+    const runner = new HarnessRunner(testConfig(), {
+      decisionClient: new QueueDecisionClient([
+        decision({ action: "inspect", tools: "read" }),
+        decision({ action: "recover", tools: "none" }),
+        decision({ action: "finish", complete: 0.99, tools: "none" })
+      ]),
+      workerClient: new QueueWorkerClient([
+        result("", [{ id: "broken", name: "read_file", arguments: { path: "x" } }]),
+        result("Recovered after the tool failure")
+      ]),
+      toolExecutor: tools,
+      receipts
+    });
+
+    const run = await runner.run({ goal: "Recover from a tool failure" });
+
+    expect(run).toMatchObject({ status: "completed", finalText: "Recovered after the tool failure" });
+    expect(run.events).toContainEqual(expect.objectContaining({
+      type: "tool_result",
+      ok: false,
+      content: expect.stringMatching(/tool adapter crashed/i)
+    }));
+    expect(receipts.records).toContainEqual(expect.objectContaining({
+      kind: "tool_result",
+      result: expect.objectContaining({ ok: false, code: "TOOL_ERROR" })
+    }));
+  });
+
   test("honors an already-aborted signal before network or tools", async () => {
     const setup = makeRunner([decision()], [result("never")]);
     const controller = new AbortController();
@@ -252,5 +300,197 @@ describe("HarnessRunner", () => {
     expect(run.status).toBe("failed");
     expect(run.error).toMatch(/aborted/i);
     expect(setup.decisionClient.snapshots).toHaveLength(0);
+  });
+
+  test("redacts configured secret values at every runner trust boundary", async () => {
+    const secret = "configured-super-secret";
+    const setup = makeRunner([
+      decision({ action: "inspect", tools: "read" }),
+      decision({ action: "finish", complete: 0.99, tools: "none" })
+    ], [
+      result(`worker echoed ${secret}`, [{
+        id: "secret-call",
+        name: "read_file",
+        arguments: { path: "src/index.ts", note: secret, [secret]: "secret used as a key" }
+      }])
+    ], { secrets: [secret], toolResult: `file contains ${secret}` });
+    const lifecycle: unknown[] = [];
+
+    const run = await setup.runner.run({
+      goal: `inspect without exposing ${secret}`,
+      onEvent: (event) => { lifecycle.push(event); }
+    });
+
+    const exposed = JSON.stringify({
+      snapshots: setup.decisionClient.snapshots,
+      workerInputs: setup.workerClient.inputs,
+      toolInputs: setup.tools.calls,
+      receipts: setup.receipts.records,
+      lifecycle,
+      run
+    });
+    expect(exposed).not.toContain(secret);
+    expect(exposed).toContain("[REDACTED]");
+  });
+
+  test("redacts provider errors and interactive answers before they re-enter the loop", async () => {
+    const secret = "answer-and-error-secret";
+    const setup = makeRunner([
+      decision(),
+      decision({ action: "ask_user", tools: "none" }),
+      decision({ action: "finish", complete: 0.99, tools: "none" })
+    ], [
+      new Error(`provider leaked ${secret}`),
+      result(`question mentions ${secret}`)
+    ], { secrets: [secret] });
+
+    const run = await setup.runner.run({
+      goal: "continue safely",
+      askUser: async () => `my answer is ${secret}`
+    });
+
+    expect(JSON.stringify({
+      snapshots: setup.decisionClient.snapshots,
+      inputs: setup.workerClient.inputs,
+      receipts: setup.receipts.records,
+      run
+    })).not.toContain(secret);
+    expect(run.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "error", content: expect.stringContaining("[REDACTED]") }),
+      expect.objectContaining({ type: "user_text", content: expect.stringContaining("[REDACTED]") })
+    ]));
+  });
+
+  test("denies reading dotenv credential files before invoking a tool", async () => {
+    const setup = makeRunner([
+      decision({ action: "inspect", tools: "read" }),
+      decision({ action: "finish", complete: 0.99 })
+    ], [result("", [{ id: "env", name: "read_file", arguments: { path: ".env" } }])]);
+
+    const run = await setup.runner.run({ goal: "Inspect credentials" });
+
+    expect(setup.tools.calls).toHaveLength(0);
+    expect(run.events).toContainEqual(expect.objectContaining({
+      type: "tool_result",
+      ok: false,
+      content: expect.stringMatching(/credential|\.env/i)
+    }));
+  });
+
+  test("does not invoke a worker when the router returns after the elapsed deadline", async () => {
+    let time = 0;
+    const config = testConfig();
+    config.routing.maxElapsedMs = 100;
+    const decisionClient: DecisionClient = {
+      async decide() {
+        time = 101;
+        return decision();
+      }
+    };
+    const workerClient = new QueueWorkerClient([result("must not run")]);
+    const runner = new HarnessRunner(config, {
+      decisionClient,
+      workerClient,
+      toolExecutor: new FakeTools(),
+      now: () => time
+    });
+
+    const run = await runner.run({ goal: "Respect the deadline" });
+
+    expect(run.status).toBe("limit");
+    expect(run.error).toMatch(/elapsed|deadline/i);
+    expect(workerClient.inputs).toHaveLength(0);
+  });
+
+  test("aborts a hanging router at the run deadline even when it ignores the signal", async () => {
+    const config = testConfig();
+    config.routing.maxElapsedMs = 20;
+    const workerClient = new QueueWorkerClient([result("must not run")]);
+    const runner = new HarnessRunner(config, {
+      decisionClient: { decide: async () => new Promise<RawRouteDecision>(() => undefined) },
+      workerClient,
+      toolExecutor: new FakeTools()
+    });
+
+    const run = await runner.run({ goal: "Bound the router" });
+
+    expect(run.status).toBe("limit");
+    expect(workerClient.inputs).toHaveLength(0);
+  });
+
+  test("rechecks the deadline after a worker and performs no tool effects", async () => {
+    let time = 0;
+    const config = testConfig();
+    config.routing.maxElapsedMs = 100;
+    const decisionClient = new QueueDecisionClient([decision({ action: "inspect", tools: "read" })]);
+    const workerClient: WorkerClient = {
+      async execute() {
+        time = 101;
+        return result("late", [{ id: "late-tool", name: "read_file", arguments: { path: "x" } }]);
+      }
+    };
+    const tools = new FakeTools();
+    const runner = new HarnessRunner(config, { decisionClient, workerClient, toolExecutor: tools, now: () => time });
+
+    const run = await runner.run({ goal: "No late effects" });
+
+    expect(run.status).toBe("limit");
+    expect(tools.calls).toHaveLength(0);
+  });
+
+  test("stops after a tool crosses the deadline and does not invoke later tools", async () => {
+    let time = 0;
+    const config = testConfig();
+    config.routing.maxElapsedMs = 100;
+    const tools: ToolExecutorLike & { calls: string[] } = {
+      calls: [],
+      async execute(call) {
+        this.calls.push(call.id);
+        time = 101;
+        return { ok: true, content: "late" };
+      }
+    };
+    const runner = new HarnessRunner(config, {
+      decisionClient: new QueueDecisionClient([decision({ action: "inspect", tools: "read" })]),
+      workerClient: new QueueWorkerClient([result("", [
+        { id: "first", name: "read_file", arguments: { path: "one" } },
+        { id: "second", name: "read_file", arguments: { path: "two" } }
+      ])]),
+      toolExecutor: tools,
+      now: () => time
+    });
+
+    const run = await runner.run({ goal: "Stop between tools" });
+
+    expect(run.status).toBe("limit");
+    expect(tools.calls).toEqual(["first"]);
+  });
+
+  test("does not record or reroute with an answer returned after the deadline", async () => {
+    let time = 0;
+    const config = testConfig();
+    config.routing.maxElapsedMs = 100;
+    const decisionClient = new QueueDecisionClient([
+      decision({ action: "ask_user", tools: "none" }),
+      decision({ action: "finish", complete: 0.99 })
+    ]);
+    const runner = new HarnessRunner(config, {
+      decisionClient,
+      workerClient: new QueueWorkerClient([result("question")]),
+      toolExecutor: new FakeTools(),
+      now: () => time
+    });
+
+    const run = await runner.run({
+      goal: "Ask safely",
+      askUser: async () => {
+        time = 101;
+        return "late answer";
+      }
+    });
+
+    expect(run.status).toBe("limit");
+    expect(run.events).not.toContainEqual(expect.objectContaining({ type: "user_text" }));
+    expect(decisionClient.snapshots).toHaveLength(1);
   });
 });

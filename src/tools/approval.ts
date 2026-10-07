@@ -27,6 +27,34 @@ export interface ApprovalHandler {
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f\u001b\u202a-\u202e\u2066-\u2069]/u;
 
+function hasShellControlSyntax(command: string): boolean {
+  let quote: "single" | "double" | undefined;
+  let escaped = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quote !== "single") {
+      escaped = true;
+      continue;
+    }
+    if (character === "'" && quote !== "double") {
+      quote = quote === "single" ? undefined : "single";
+      continue;
+    }
+    if (character === "\"" && quote !== "single") {
+      quote = quote === "double" ? undefined : "double";
+      continue;
+    }
+    if (quote === "single") continue;
+    if (character === "`" || (character === "$" && command[index + 1] === "(")) return true;
+    if (!quote && character !== undefined && ";&|<>".includes(character)) return true;
+  }
+  return escaped || quote !== undefined;
+}
+
 function approved(reason: string): ApprovalDecision {
   return { allowed: true, reason, approvalId: randomUUID() };
 }
@@ -54,7 +82,7 @@ export class PolicyApprovalHandler implements ApprovalHandler {
     if (this.#config.blockedCommandPatterns.some((pattern) => new RegExp(pattern, "u").test(command))) {
       return { allowed: false, reason: "blocked_command" };
     }
-    const safePrefix = this.#config.safeCommandPrefixes.some(
+    const safePrefix = !hasShellControlSyntax(command) && this.#config.safeCommandPrefixes.some(
       (prefix) => command === prefix || command.startsWith(`${prefix} `)
     );
     const mode = this.#config.approvals.shell;

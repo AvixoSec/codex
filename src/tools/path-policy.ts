@@ -32,6 +32,14 @@ export class PathPolicy {
     return new PathPolicy(root, maxFileBytes);
   }
 
+  isSensitivePath(input: string): boolean {
+    const candidate = isAbsolute(input) ? input : resolve(this.root, input);
+    const path = relative(this.root, candidate);
+    return path.split(/[\\/]/u).some((part) =>
+      part === ".env" || (part.startsWith(".env.") && part !== ".env.example")
+    );
+  }
+
   #lexicalPath(input: string): string {
     if (!input || input.includes("\0")) throw new Error("Invalid workspace path");
     if (isAbsolute(input) || win32.isAbsolute(input)) throw new Error("Absolute paths are outside the workspace");
@@ -52,7 +60,9 @@ export class PathPolicy {
   }
 
   async readPath(input: string): Promise<string> {
+    if (this.isSensitivePath(input)) throw new Error("Reading sensitive credential files is not allowed");
     const resolved = await this.existingPath(input);
+    if (this.isSensitivePath(resolved)) throw new Error("Reading sensitive credential files is not allowed");
     const info = await stat(resolved);
     if (!info.isFile()) throw new Error("Read target must be a file");
     if (info.size > this.#maxFileBytes) {

@@ -9,6 +9,13 @@ semantic agent step. It does not choose a named profile. Jev independently
 selects the provider/model, reasoning effort, included context, output cap,
 temperature, tool policy, and next action from values you configure.
 
+This design follows TypeSafe's official System One contract: the harness sends
+one structured state plus several independent typed questions, then uses the
+returned choices, probabilities, and confidence in ordinary code. See the
+[TypeSafe introduction](https://docs.typesafe.ai/introduction),
+[HTTP API reference](https://docs.typesafe.ai/api), and
+[confidence-gated routing pattern](https://docs.typesafe.ai/patterns/confidence-routing).
+
 Different steps may use entirely different OpenAI-compatible base URLs:
 
     goal
@@ -65,7 +72,10 @@ is omitted while the chosen target and other valid settings remain intact.
 The selected contextTokens value controls how much task history Jev Harness
 includes in the next worker request. It does not change a remote model's
 physical context window. The declared model contextWindow remains a hard local
-ceiling, with output tokens and a safety margin reserved first.
+ceiling, with output tokens and a safety margin reserved first. The serialized
+request—including fixed instructions and tool schemas—is fitted to the selected
+input budget. Tool calls and their results are retained or dropped as atomic
+pairs so provider history is never malformed.
 
 ## Configuration
 
@@ -110,6 +120,9 @@ Global flags:
 
 Config discovery order is: --config, JEV_HARNESS_CONFIG, then the nearest
 jev-harness.yaml while walking toward the filesystem root.
+
+Both `doctor` and `run` load `.env` next to the resolved configuration without
+overwriting variables already present in the process environment.
 
 ### Normal mode
 
@@ -196,6 +209,8 @@ It never calls Jev, a model provider, or a tool.
   tool effect.
 - Repeated router/provider failures stop the loop.
 - Step and elapsed-time limits are enforced locally.
+- One deadline signal covers Jev, worker, approval, tool, and user-input waits;
+  no later phase starts after the elapsed limit.
 - Unknown, malformed, or duplicated tool calls are converted to failed tool
   results and never executed.
 - The router snapshot contains bounded excerpts labeled as untrusted content.

@@ -117,6 +117,134 @@ describe("CLI commands", () => {
     expect(stderr.value()).toBe("");
   });
 
+  test.each([
+    ["completed", true, 0],
+    ["failed", false, 1],
+    ["limit", false, 1],
+    ["needs_input", false, 2]
+  ] as const)("reports a %s JSON run truthfully", async (status, ok, expectedExitCode) => {
+    const directory = await mkdtemp(join(tmpdir(), "jevh-json-status-"));
+    const created = await initProject(directory);
+    const stdout = capture();
+    const stderr = capture();
+    let exitCode = 0;
+    const program = createProgram({
+      cwd: directory,
+      env: {},
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      setExitCode: (code) => { exitCode = code; },
+      runTask: async () => ({
+        runId: "run-json-status",
+        status,
+        finalText: "",
+        events: [],
+        steps: 1
+      })
+    });
+
+    await program.parseAsync(["--config", created.configPath, "--json", "run", "check", "status"], { from: "user" });
+
+    expect(JSON.parse(stdout.value())).toMatchObject({
+      schemaVersion: 1,
+      ok,
+      command: "run",
+      data: { status }
+    });
+    expect(exitCode).toBe(expectedExitCode);
+    expect(stderr.value()).toBe("");
+  });
+
+  test("reports a failing doctor truthfully in JSON and exits nonzero", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "jevh-json-doctor-"));
+    const created = await initProject(directory);
+    const stdout = capture();
+    const stderr = capture();
+    let exitCode = 0;
+    const program = createProgram({
+      cwd: directory,
+      env: {},
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      setExitCode: (code) => { exitCode = code; }
+    });
+
+    await program.parseAsync([
+      "--config", created.configPath,
+      "--json", "doctor",
+      "--workspace", directory
+    ], { from: "user" });
+
+    expect(JSON.parse(stdout.value())).toMatchObject({
+      schemaVersion: 1,
+      ok: false,
+      command: "doctor",
+      data: { ok: false }
+    });
+    expect(exitCode).toBe(1);
+    expect(stderr.value()).toBe("");
+  });
+
+  test("does not force interactive mode for a default or piped invocation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "jevh-interactive-default-"));
+    const created = await initProject(directory);
+    const stdout = capture();
+    const stderr = capture();
+    let received: Parameters<NonNullable<Parameters<typeof createProgram>[0]["runTask"]>>[0] | undefined;
+    const program = createProgram({
+      cwd: directory,
+      env: {},
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      runTask: async (options) => {
+        received = options;
+        return {
+          runId: "run-default-interactive",
+          status: "completed",
+          finalText: "done",
+          events: [],
+          steps: 1
+        };
+      }
+    });
+
+    await program.parseAsync(["--config", created.configPath, "run", "check", "pipes"], { from: "user" });
+
+    expect(received).toBeDefined();
+    expect(received).not.toHaveProperty("interactive");
+  });
+
+  test("passes an explicit non-interactive request through to the runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "jevh-non-interactive-"));
+    const created = await initProject(directory);
+    const stdout = capture();
+    const stderr = capture();
+    let interactive: boolean | undefined;
+    const program = createProgram({
+      cwd: directory,
+      env: {},
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      runTask: async (options) => {
+        interactive = options.interactive;
+        return {
+          runId: "run-explicit-non-interactive",
+          status: "completed",
+          finalText: "done",
+          events: [],
+          steps: 1
+        };
+      }
+    });
+
+    await program.parseAsync([
+      "--config", created.configPath,
+      "run", "--non-interactive", "check", "pipes"
+    ], { from: "user" });
+
+    expect(interactive).toBe(false);
+  });
+
   test("replays receipt records without executing a run", async () => {
     const directory = await mkdtemp(join(tmpdir(), "jevh-replay-"));
     const path = join(directory, "receipt.jsonl");

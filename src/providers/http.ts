@@ -22,6 +22,34 @@ function retryable(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET"
+]);
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const code = Reflect.get(error, "code");
+  if (typeof code === "string") return code;
+  return errorCode(Reflect.get(error, "cause"));
+}
+
+export function isTransientNetworkFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "TimeoutError") return true;
+  const code = errorCode(error);
+  if (code && TRANSIENT_NETWORK_CODES.has(code)) return true;
+  return error instanceof TypeError && /(?:fetch failed|failed to fetch|network ?error|socket|connection|terminated)/iu.test(error.message);
+}
+
 export async function postJson(
   options: PostJsonOptions,
   dependencies: HttpDependencies = {}
@@ -33,45 +61,46 @@ export async function postJson(
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= options.retries; attempt += 1) {
+    let response: Response;
     try {
-      const response = await fetcher(options.url, {
+      response = await fetcher(options.url, {
         method: "POST",
         redirect: "error",
         headers: { "Content-Type": "application/json", ...options.headers },
         body: JSON.stringify(options.body),
         signal: combinedSignal(options.timeoutMs, options.signal)
       });
-      const text = await response.text();
-      if (Buffer.byteLength(text, "utf8") > (options.maxResponseBytes ?? 10_000_000)) {
-        throw new Error("Provider response exceeded the configured byte limit");
-      }
-      if (!response.ok) {
-        const error = new Error(`Provider HTTP ${response.status}: ${text.slice(0, 500)}`);
-        if (retryable(response.status) && attempt < options.retries) {
-          lastError = error;
-          await sleep(Math.min(2_000, 150 * (2 ** attempt)));
-          continue;
-        }
-        throw error;
-      }
-      let payload: unknown;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        throw new Error("Provider returned invalid JSON");
-      }
-      if (typeof payload === "object" && payload !== null && "error" in payload) {
-        throw new Error(`Provider returned an error object: ${JSON.stringify((payload as { error: unknown }).error).slice(0, 500)}`);
-      }
-      return payload;
     } catch (error) {
       if (options.signal?.aborted) throw error;
       lastError = error;
-      if (attempt >= options.retries || (error instanceof Error && /^Provider HTTP 4/.test(error.message) && !/^Provider HTTP 4(08|29)/.test(error.message))) {
-        throw error;
-      }
+      if (attempt >= options.retries || !isTransientNetworkFailure(error)) throw error;
       await sleep(Math.min(2_000, 150 * (2 ** attempt)));
+      continue;
     }
+
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > (options.maxResponseBytes ?? 10_000_000)) {
+      throw new Error("Provider response exceeded the configured byte limit");
+    }
+    if (!response.ok) {
+      const error = new Error(`Provider HTTP ${response.status}: ${text.slice(0, 500)}`);
+      if (retryable(response.status) && attempt < options.retries) {
+        lastError = error;
+        await sleep(Math.min(2_000, 150 * (2 ** attempt)));
+        continue;
+      }
+      throw error;
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error("Provider returned invalid JSON");
+    }
+    if (typeof payload === "object" && payload !== null && "error" in payload) {
+      throw new Error(`Provider returned an error object: ${JSON.stringify((payload as { error: unknown }).error).slice(0, 500)}`);
+    }
+    return payload;
   }
   throw lastError instanceof Error ? lastError : new Error("Provider request failed");
 }

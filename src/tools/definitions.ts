@@ -1,5 +1,9 @@
 import { TOOL_POLICIES, type HarnessConfig, type ToolDefinition, type ToolPolicy } from "../core/types.js";
 
+function nullable(schema: Record<string, unknown>): Record<string, unknown> {
+  return { anyOf: [schema, { type: "null" }] };
+}
+
 const DEFINITIONS: ToolDefinition[] = [
   {
     name: "list_files",
@@ -8,9 +12,10 @@ const DEFINITIONS: ToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative directory; defaults to ." },
-        maxDepth: { type: "integer", minimum: 0, maximum: 10 }
+        path: nullable({ type: "string", description: "Workspace-relative directory; null defaults to ." }),
+        maxDepth: nullable({ type: "integer", minimum: 0, maximum: 10 })
       },
+      required: ["path", "maxDepth"],
       additionalProperties: false
     }
   },
@@ -22,10 +27,10 @@ const DEFINITIONS: ToolDefinition[] = [
       type: "object",
       properties: {
         path: { type: "string" },
-        startLine: { type: "integer", minimum: 1 },
-        endLine: { type: "integer", minimum: 1 }
+        startLine: nullable({ type: "integer", minimum: 1 }),
+        endLine: nullable({ type: "integer", minimum: 1 })
       },
-      required: ["path"],
+      required: ["path", "startLine", "endLine"],
       additionalProperties: false
     }
   },
@@ -37,10 +42,10 @@ const DEFINITIONS: ToolDefinition[] = [
       type: "object",
       properties: {
         query: { type: "string", minLength: 1 },
-        path: { type: "string" },
-        maxResults: { type: "integer", minimum: 1, maximum: 500 }
+        path: nullable({ type: "string" }),
+        maxResults: nullable({ type: "integer", minimum: 1, maximum: 500 })
       },
-      required: ["query"],
+      required: ["query", "path", "maxResults"],
       additionalProperties: false
     }
   },
@@ -68,9 +73,9 @@ const DEFINITIONS: ToolDefinition[] = [
         path: { type: "string" },
         oldText: { type: "string" },
         newText: { type: "string" },
-        replaceAll: { type: "boolean" }
+        replaceAll: nullable({ type: "boolean" })
       },
-      required: ["path", "oldText", "newText"],
+      required: ["path", "oldText", "newText", "replaceAll"],
       additionalProperties: false
     }
   },
@@ -82,9 +87,9 @@ const DEFINITIONS: ToolDefinition[] = [
       type: "object",
       properties: {
         command: { type: "string", minLength: 1 },
-        timeoutMs: { type: "integer", minimum: 1 }
+        timeoutMs: nullable({ type: "integer", minimum: 1 })
       },
-      required: ["command"],
+      required: ["command", "timeoutMs"],
       additionalProperties: false
     }
   }

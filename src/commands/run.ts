@@ -71,7 +71,13 @@ export async function runHarnessTask(options: RunCommandOptions): Promise<RunRes
     ...(options.promptApproval ? { prompt: options.promptApproval } : interactive ? { prompt: confirm } : {})
   });
   const receipts = new ReceiptStore(resolve(workspace, config.receipts.directory), [...secrets]);
-  const runner = new HarnessRunner(config, { decisionClient, workerClient, toolExecutor, receipts });
+  const runner = new HarnessRunner(config, {
+    decisionClient,
+    workerClient,
+    toolExecutor,
+    receipts,
+    secrets: [...secrets]
+  });
   const runOptions: RunOptions = {
     goal: options.goal,
     ...(options.maxSteps !== undefined ? { maxSteps: options.maxSteps } : {}),

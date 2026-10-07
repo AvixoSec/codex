@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { ToolDefinition } from "../src/core/types.js";
+import { buildContext, estimateTokens } from "../src/context/budget.js";
 import {
   buildChatCompletionsRequest,
   parseChatCompletionsResponse
@@ -11,6 +12,7 @@ import {
 } from "../src/providers/responses.js";
 import { OpenAICompatibleWorkerClient } from "../src/providers/worker-client.js";
 import { resolveRoute, type RawRouteDecision } from "../src/router/resolve.js";
+import { toolDefinitions } from "../src/tools/definitions.js";
 import { testConfig } from "./fixtures.js";
 
 const tools: ToolDefinition[] = [{
@@ -113,6 +115,21 @@ describe("chat-completions adapter", () => {
     });
   });
 
+  test("does not let extraBody resurrect omitted effort or temperature", () => {
+    const selected = { ...route(), wireEffort: undefined, temperature: undefined };
+    const request = buildChatCompletionsRequest({
+      goal: context.goal,
+      context,
+      route: selected,
+      tools,
+      providerExtraBody: { reasoning_effort: "provider-wrong", temperature: 1.9 },
+      modelExtraBody: { reasoning_effort: "model-wrong", temperature: 1.8 }
+    });
+
+    expect(request).not.toHaveProperty("reasoning_effort");
+    expect(request).not.toHaveProperty("temperature");
+  });
+
   test.each([
     ["invalid arguments", '{"path":'],
     ["non-object arguments", '["src/index.ts"]'],
@@ -194,6 +211,60 @@ describe("responses adapter", () => {
     expect(result.text).toBe("Checking.");
     expect(result.toolCalls).toEqual([{ id: "c1", name: "read_file", arguments: { path: "x.ts" } }]);
     expect(result.usage).toEqual({ inputTokens: 11, outputTokens: 5 });
+  });
+});
+
+describe("worker request input bounds", () => {
+  test("strict tool schemas require every property and represent defaults as nullable", () => {
+    const definitions = toolDefinitions(testConfig(), "shell");
+
+    for (const definition of definitions) {
+      const properties = definition.parameters.properties as Record<string, unknown>;
+      expect(definition.parameters.required).toEqual(Object.keys(properties));
+    }
+    expect((definitions.find((item) => item.name === "read_file")!.parameters.properties as Record<string, unknown>)
+      .startLine).toMatchObject({ anyOf: [{ type: "integer" }, { type: "null" }] });
+  });
+
+  test.each([
+    ["chat-completions", buildChatCompletionsRequest],
+    ["responses", buildResponsesRequest]
+  ] as const)("keeps the complete %s body within the selected context budget", (_api, buildRequest) => {
+    const selected = { ...route(), contextTokens: 1_500 };
+    const goal = "Inspect the implementation carefully. ".repeat(100);
+    const bounded = buildContext(goal, [
+      { type: "assistant_text", content: "historical evidence ".repeat(200), step: 1 }
+    ], selected.contextTokens);
+    const request = buildRequest({
+      goal,
+      context: bounded,
+      route: selected,
+      tools: toolDefinitions(testConfig(), "shell"),
+      providerExtraBody: {},
+      modelExtraBody: {}
+    });
+
+    expect(estimateTokens(request)).toBeLessThanOrEqual(selected.contextTokens);
+  });
+
+  test.each([
+    ["chat-completions", buildChatCompletionsRequest],
+    ["responses", buildResponsesRequest]
+  ] as const)("never reinserts the raw unbounded goal into a %s body", (_api, buildRequest) => {
+    const selected = route();
+    const rawGoal = `${"long goal prefix ".repeat(2_000)}UNIQUE_RAW_GOAL_TAIL`;
+    const bounded = buildContext(rawGoal, [], 80);
+    const request = buildRequest({
+      goal: rawGoal,
+      context: bounded,
+      route: selected,
+      tools,
+      providerExtraBody: {},
+      modelExtraBody: {}
+    });
+
+    expect(JSON.stringify(request)).not.toContain("UNIQUE_RAW_GOAL_TAIL");
+    expect(JSON.stringify(request)).toContain("truncated by Jev Harness");
   });
 });
 

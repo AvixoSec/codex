@@ -125,10 +125,17 @@ results, route decisions, errors, and adjustments. The router snapshot contains
 short excerpts only and labels model/tool text as untrusted.
 
 The worker context builder uses the selected contextTokens as a budget. It
-always preserves the original goal and latest event, then includes recent
-events newest-first until the conservative estimator reaches the budget.
-Oversized content is truncated with an explicit marker. Context selection is
-therefore a real harness behavior, not an unsupported provider parameter.
+preserves a bounded form of the original goal, then includes recent event units
+newest-first until the conservative estimator reaches the budget. A tool call
+and its matching result form one atomic unit: both are retained, with a bounded
+result when possible, or both are dropped. Orphan protocol events are never
+serialized. Oversized text is truncated with an explicit marker.
+
+The provider serializer then fits the complete input—including fixed
+instructions and tool schemas—inside the selected budget. If even the fixed
+request cannot fit, the call fails locally instead of silently exceeding the
+model window. Context selection is therefore a real harness behavior, not an
+unsupported provider parameter.
 
 The estimator intentionally uses a conservative UTF-8-byte heuristic because
 the harness serves arbitrary models. Receipts label the count as estimated.

@@ -33,23 +33,54 @@ function truncateEvent(event: AgentEvent, tokenBudget: number): AgentEvent | und
   }
   const fixed = { ...event, content: "" };
   const fixedTokens = estimateTokens(fixed);
-  if (fixedTokens >= tokenBudget) return undefined;
+  if (fixedTokens > tokenBudget) return undefined;
   return { ...event, content: truncateText(event.content, tokenBudget - fixedTokens) };
 }
 
-function requiredTail(events: readonly AgentEvent[]): AgentEvent[] {
-  const latest = events.at(-1);
-  if (!latest) return [];
-  if (latest.type !== "tool_result") return [latest];
-  let matchingIndex = -1;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    if (event.type === "tool_call" && event.id === latest.callId) {
-      matchingIndex = index;
-      break;
-    }
+interface EventUnit {
+  events: AgentEvent[];
+  order: number;
+  recency: number;
+}
+
+function completeEventUnits(events: readonly AgentEvent[]): EventUnit[] {
+  const pairedIndexes = new Set<number>();
+  const units: EventUnit[] = [];
+
+  for (let callIndex = 0; callIndex < events.length; callIndex += 1) {
+    const call = events[callIndex]!;
+    if (call.type !== "tool_call" || pairedIndexes.has(callIndex)) continue;
+    const resultIndex = events.findIndex((candidate, index) =>
+      index > callIndex &&
+      !pairedIndexes.has(index) &&
+      candidate.type === "tool_result" &&
+      candidate.callId === call.id
+    );
+    if (resultIndex < 0) continue;
+    pairedIndexes.add(callIndex);
+    pairedIndexes.add(resultIndex);
+    units.push({ events: [call, events[resultIndex]!], order: callIndex, recency: resultIndex });
   }
-  return matchingIndex >= 0 ? [events[matchingIndex]!, latest] : [latest];
+
+  events.forEach((event, index) => {
+    if (event.type === "assistant_text" || event.type === "user_text" || event.type === "error") {
+      units.push({ events: [event], order: index, recency: index });
+    }
+  });
+  return units;
+}
+
+function truncateUnit(unit: EventUnit, tokenBudget: number): EventUnit | undefined {
+  if (unit.events.length === 1) {
+    const bounded = truncateEvent(unit.events[0]!, tokenBudget);
+    return bounded ? { ...unit, events: [bounded] } : undefined;
+  }
+  const [call, result] = unit.events;
+  if (!call || call.type !== "tool_call" || !result || result.type !== "tool_result") return undefined;
+  const callTokens = estimateTokens(call);
+  const boundedResult = truncateEvent(result, tokenBudget - callTokens);
+  if (!boundedResult) return undefined;
+  return { ...unit, events: [call, boundedResult] };
 }
 
 export function buildContext(goal: string, events: readonly AgentEvent[], tokenBudget: number): BoundedContext {
@@ -65,44 +96,58 @@ export function buildContext(goal: string, events: readonly AgentEvent[], tokenB
     return { goal: boundedGoal, events: [], estimatedTokens: Math.min(used, tokenBudget), truncated: true };
   }
 
-  const tail = requiredTail(events);
-  const selected: AgentEvent[] = [];
+  const units = completeEventUnits(events);
+  const selected: EventUnit[] = [];
   let remaining = tokenBudget - used;
 
-  for (const event of tail) {
-    const cost = estimateTokens(event);
-    if (cost <= remaining) {
-      selected.push(event);
-      remaining -= cost;
-      used += cost;
-      continue;
-    }
-    const bounded = truncateEvent(event, remaining);
-    if (bounded) {
-      const boundedCost = estimateTokens(bounded);
-      selected.push(bounded);
-      remaining -= boundedCost;
-      used += boundedCost;
-      truncated = true;
-    }
-  }
+  const newestFirst = [...units].sort((left, right) => right.recency - left.recency);
+  newestFirst.forEach((unit, index) => {
+    const cost = unit.events.reduce((total, event) => total + estimateTokens(event), 0);
+    let selectedUnit: EventUnit | undefined;
+    if (cost <= remaining) selectedUnit = unit;
+    else if (index === 0) selectedUnit = truncateUnit(unit, remaining);
 
-  const tailSet = new Set(tail);
-  const older: AgentEvent[] = [];
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    if (tailSet.has(event)) continue;
-    const cost = estimateTokens(event);
-    if (cost > remaining) {
+    if (!selectedUnit) {
       truncated = true;
-      continue;
+      return;
     }
-    older.unshift(event);
-    remaining -= cost;
-    used += cost;
-  }
+    const selectedCost = selectedUnit.events.reduce((total, event) => total + estimateTokens(event), 0);
+    selected.push(selectedUnit);
+    remaining -= selectedCost;
+    used += selectedCost;
+    if (selectedCost < cost) truncated = true;
+  });
 
-  const selectedEvents = [...older, ...selected];
+  const selectedEvents = selected
+    .sort((left, right) => left.order - right.order)
+    .flatMap((unit) => unit.events);
   if (selectedEvents.length < events.length) truncated = true;
   return { goal: boundedGoal, events: selectedEvents, estimatedTokens: used, truncated };
+}
+
+export function fitContextToSerializedBudget<T>(
+  context: BoundedContext,
+  tokenBudget: number,
+  serialize: (bounded: BoundedContext) => T
+): BoundedContext {
+  if (estimateTokens(serialize(context)) <= tokenBudget) return context;
+
+  let lower = 1;
+  let upper = Math.min(tokenBudget, context.estimatedTokens);
+  let best: BoundedContext | undefined;
+  while (lower <= upper) {
+    const candidateBudget = Math.floor((lower + upper) / 2);
+    const candidate = buildContext(context.goal, context.events, candidateBudget);
+    if (estimateTokens(serialize(candidate)) <= tokenBudget) {
+      best = candidate;
+      lower = candidateBudget + 1;
+    } else {
+      upper = candidateBudget - 1;
+    }
+  }
+
+  if (!best) {
+    throw new Error(`Selected context budget ${tokenBudget} cannot fit the fixed worker request`);
+  }
+  return { ...best, truncated: true };
 }

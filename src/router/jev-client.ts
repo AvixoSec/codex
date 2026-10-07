@@ -1,4 +1,5 @@
 import type { HarnessConfig } from "../core/types.js";
+import { isTransientNetworkFailure } from "../providers/http.js";
 import { buildQuestions } from "./questions.js";
 import type { RawChoiceDecision, RawRouteDecision, RouteField } from "./resolve.js";
 
@@ -116,8 +117,9 @@ export class JevHttpClient implements DecisionClient {
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.#config.jev.retries; attempt += 1) {
+      let response: Response;
       try {
-        const response = await this.#fetch(this.#config.jev.endpoint, {
+        response = await this.#fetch(this.#config.jev.endpoint, {
           method: "POST",
           redirect: "error",
           headers: {
@@ -127,38 +129,37 @@ export class JevHttpClient implements DecisionClient {
           body,
           signal: abortSignal(this.#config.jev.timeoutMs, signal)
         });
-        const text = await response.text();
-        if (text.length > 2_000_000) throw new Error("Jev response exceeded 2 MB");
-        if (!response.ok) {
-          const error = new Error(`Jev HTTP ${response.status}: ${text.slice(0, 500)}`);
-          if ((response.status === 429 || response.status === 529 || response.status >= 500) && attempt < this.#config.jev.retries) {
-            lastError = error;
-            await this.#backoff(attempt);
-            continue;
-          }
-          throw error;
-        }
-        let payload: unknown;
-        try {
-          payload = JSON.parse(text);
-        } catch {
-          throw new Error("Jev returned invalid JSON");
-        }
-        return parseDecisionResponse(payload);
       } catch (error) {
         if (signal?.aborted) throw error;
         lastError = error;
-        if (attempt >= this.#config.jev.retries || !this.#isTransient(error)) throw error;
+        if (attempt >= this.#config.jev.retries || !isTransientNetworkFailure(error)) throw error;
         await this.#backoff(attempt);
+        continue;
       }
+
+      const text = await response.text();
+      if (text.length > 2_000_000) throw new Error("Jev response exceeded 2 MB");
+      if (!response.ok) {
+        const error = new Error(`Jev HTTP ${response.status}: ${text.slice(0, 500)}`);
+        if ((response.status === 429 || response.status === 529 || response.status >= 500) && attempt < this.#config.jev.retries) {
+          lastError = error;
+          await this.#backoff(attempt);
+          continue;
+        }
+        throw error;
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new Error("Jev returned invalid JSON");
+      }
+      if (isRecord(payload) && "error" in payload) {
+        throw new Error(`Jev returned an error object: ${JSON.stringify(payload.error).slice(0, 500)}`);
+      }
+      return parseDecisionResponse(payload);
     }
     throw lastError instanceof Error ? lastError : new Error("Jev request failed");
-  }
-
-  #isTransient(error: unknown): boolean {
-    if (!(error instanceof Error)) return false;
-    if (/Jev HTTP (4\d\d)/.test(error.message) && !/Jev HTTP 429/.test(error.message)) return false;
-    return true;
   }
 
   async #backoff(attempt: number): Promise<void> {

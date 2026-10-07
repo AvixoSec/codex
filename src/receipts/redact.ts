@@ -1,4 +1,11 @@
 const SENSITIVE_KEY = /authorization|api[-_]?key|token|secret|password|cookie/i;
+const SAFE_NUMERIC_KEYS = new Set([
+  "contextTokens",
+  "maxOutputTokens",
+  "inputTokens",
+  "outputTokens",
+  "contextEstimatedTokens"
+]);
 
 function maskString(value: string, secrets: readonly string[]): string {
   return secrets
@@ -10,7 +17,9 @@ function maskString(value: string, secrets: readonly string[]): string {
 export function redact(value: unknown, secrets: readonly string[] = []): unknown {
   const seen = new WeakSet<object>();
   const visit = (current: unknown, key?: string): unknown => {
-    if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]";
+    if (key && SENSITIVE_KEY.test(key) && !(typeof current === "number" && SAFE_NUMERIC_KEYS.has(key))) {
+      return "[REDACTED]";
+    }
     if (typeof current === "string") return maskString(current, secrets);
     if (Array.isArray(current)) return current.map((item) => visit(item));
     if (typeof current !== "object" || current === null) return current;

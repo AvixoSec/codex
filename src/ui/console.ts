@@ -74,8 +74,8 @@ export class ConsoleUI {
   }
 }
 
-export function jsonEnvelope(command: string, data: unknown): string {
-  return JSON.stringify({ schemaVersion: 1, ok: true, command, data });
+export function jsonEnvelope(command: string, data: unknown, ok = true): string {
+  return JSON.stringify({ schemaVersion: 1, ok, command, data });
 }
 
 export function jsonError(command: string, error: unknown): string {

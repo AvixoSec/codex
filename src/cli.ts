@@ -21,6 +21,11 @@ interface GlobalOptions {
   quiet?: boolean;
 }
 
+interface CommandOutcome {
+  ok: boolean;
+  exitCode?: number;
+}
+
 export interface CliDependencies {
   cwd?: string;
   env?: Record<string, string | undefined>;
@@ -69,11 +74,14 @@ export function createProgram(dependencies: CliDependencies = {}): Command {
   const perform = async (
     command: string,
     action: () => Promise<unknown>,
-    human: (value: any, output: ConsoleUI) => void
+    human: (value: any, output: ConsoleUI) => void,
+    outcome: (value: any) => CommandOutcome = () => ({ ok: true })
   ) => {
     try {
       const value = await action();
-      if (globals().json) stdout.write(jsonEnvelope(command, value) + "\n");
+      const commandOutcome = outcome(value);
+      if (commandOutcome.exitCode !== undefined) setExitCode(commandOutcome.exitCode);
+      if (globals().json) stdout.write(jsonEnvelope(command, value, commandOutcome.ok) + "\n");
       else human(value, ui());
     } catch (error) {
       setExitCode(1);
@@ -129,8 +137,8 @@ export function createProgram(dependencies: CliDependencies = {}): Command {
           const label = check.status === "pass" ? "PASS" : check.status === "warn" ? "WARN" : "FAIL";
           output.line(label.padEnd(5) + " " + check.name + " · " + check.message);
         }
-        if (!value.ok) setExitCode(1);
-      }
+      },
+      (value) => value.ok ? { ok: true } : { ok: false, exitCode: 1 }
     ));
 
   program.command("models")
@@ -176,14 +184,16 @@ export function createProgram(dependencies: CliDependencies = {}): Command {
             ...(options.maxSteps !== undefined ? { maxSteps: options.maxSteps } : {}),
             ...(options.shadow !== undefined ? { shadow: options.shadow } : {}),
             ...(options.yes !== undefined ? { assumeYes: options.yes } : {}),
-            interactive: !options.nonInteractive,
+            ...(options.nonInteractive ? { interactive: false } : {}),
             ...(!globals().json ? { onEvent: (event) => output.lifecycle(event) } : {})
           });
         },
         (result: RunResult, output) => {
           output.final(result);
-          if (result.status !== "completed") setExitCode(result.status === "needs_input" ? 2 : 1);
-        }
+        },
+        (result: RunResult) => result.status === "completed"
+          ? { ok: true }
+          : { ok: false, exitCode: result.status === "needs_input" ? 2 : 1 }
       );
     });
 

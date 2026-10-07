@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 
+import { replayReceipts } from "../src/commands/replay.js";
 import { redact } from "../src/receipts/redact.js";
 import { ReceiptStore } from "../src/receipts/store.js";
 
@@ -49,6 +50,58 @@ describe("receipt store", () => {
     expect(records.map((record) => record.sequence)).toEqual([1, 2, 3]);
     expect(JSON.stringify(records)).not.toContain("secret-value");
     expect(mode).toBe(0o600);
+  });
+
+  test("preserves numeric token metrics through storage and replay while redacting credentials", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "jevh-receipts-"));
+    const store = new ReceiptStore(directory, ["fixture-known-value"]);
+
+    await store.append("run-metrics", {
+      kind: "route",
+      step: 1,
+      resolved: {
+        action: "inspect",
+        target: "local/code",
+        effort: "high",
+        contextTokens: 16_000,
+        maxOutputTokens: 4_000,
+        toolPolicy: "read"
+      },
+      usage: { inputTokens: 321, outputTokens: 22 },
+      token: "fixture-token-value",
+      note: "contains fixture-known-value"
+    });
+    await store.append("run-metrics", {
+      kind: "worker",
+      step: 1,
+      contextEstimatedTokens: 1_337,
+      result: { usage: { inputTokens: 456, outputTokens: 78 } },
+      apiKey: "fixture-key-value"
+    });
+
+    const replay = await replayReceipts(store.resolveRun("run-metrics"));
+    const routeRecord = replay.records[0];
+    const workerRecord = replay.records[1];
+
+    expect(replay.routes).toEqual([{
+      step: 1,
+      target: "local/code",
+      action: "inspect",
+      effort: "high",
+      contextTokens: 16_000,
+      maxOutputTokens: 4_000,
+      toolPolicy: "read"
+    }]);
+    expect(routeRecord?.usage).toEqual({ inputTokens: 321, outputTokens: 22 });
+    expect(workerRecord).toMatchObject({
+      contextEstimatedTokens: 1_337,
+      result: { usage: { inputTokens: 456, outputTokens: 78 } }
+    });
+    expect(routeRecord).toMatchObject({
+      token: "[REDACTED]",
+      note: "contains [REDACTED]"
+    });
+    expect(workerRecord).toMatchObject({ apiKey: "[REDACTED]" });
   });
 
   test("resolves an explicit receipt path without re-executing anything", async () => {
