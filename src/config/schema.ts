@@ -55,6 +55,7 @@ const providerSchema = z.strictObject({
   api: z.enum(["chat-completions", "responses"]),
   apiKeyEnv: envNameSchema.optional(),
   timeoutMs: positiveInteger.default(120_000),
+  retries: z.number().int().min(0).max(5).default(1),
   headersFromEnv: z.record(z.string().min(1), envNameSchema).default({}),
   extraBody: z.record(z.string(), z.unknown()).default({}),
   models: z.record(idSchema, modelSchema).refine(

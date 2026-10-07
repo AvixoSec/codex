@@ -88,6 +88,7 @@ export interface ProviderConfig {
   api: ProviderApi;
   apiKeyEnv?: string;
   timeoutMs: number;
+  retries: number;
   headersFromEnv: Record<string, string>;
   extraBody: Record<string, unknown>;
   models: Record<string, ModelConfig>;
@@ -162,3 +163,35 @@ export interface AgentToolResultEvent {
 }
 
 export type AgentEvent = AgentTextEvent | AgentToolCallEvent | AgentToolResultEvent;
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  minimumPolicy: ToolPolicy;
+}
+
+export interface ToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export interface WorkerUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface WorkerResult {
+  text: string;
+  toolCalls: ToolCall[];
+  usage?: WorkerUsage;
+  finishReason?: string;
+}
+
+export interface BoundedContext {
+  goal: string;
+  events: AgentEvent[];
+  estimatedTokens: number;
+  truncated: boolean;
+}

@@ -39,6 +39,7 @@ providers:
     api: responses
     apiKeyEnv: OPENAI_API_KEY
     timeoutMs: 120000
+    retries: 1
     headersFromEnv: {}
     extraBody: {}
     models:
@@ -56,6 +57,7 @@ providers:
     baseUrl: http://127.0.0.1:11434/v1
     api: chat-completions
     timeoutMs: 120000
+    retries: 1
     headersFromEnv: {}
     extraBody: {}
     models:
