@@ -17,6 +17,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:e2e": "vitest run tests/e2e.test.ts",
     "test:watch": "vitest",
     "dev": "tsx src/cli.ts"
   },
