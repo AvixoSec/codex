@@ -1,0 +1,79 @@
+import { randomUUID } from "node:crypto";
+
+import type { ToolsConfig } from "../core/types.js";
+
+export interface ApprovalRequest {
+  kind: "write" | "shell";
+  summary: string;
+  exactAction: string;
+  command?: string;
+}
+
+export interface ApprovalDecision {
+  allowed: boolean;
+  reason: string;
+  approvalId?: string;
+}
+
+export interface ApprovalOptions {
+  interactive: boolean;
+  assumeYes?: boolean;
+  prompt?: (request: ApprovalRequest) => Promise<boolean>;
+}
+
+export interface ApprovalHandler {
+  authorize(request: ApprovalRequest): Promise<ApprovalDecision>;
+}
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f\u001b\u202a-\u202e\u2066-\u2069]/u;
+
+function approved(reason: string): ApprovalDecision {
+  return { allowed: true, reason, approvalId: randomUUID() };
+}
+
+export class PolicyApprovalHandler implements ApprovalHandler {
+  readonly #config: ToolsConfig;
+  readonly #options: ApprovalOptions;
+
+  constructor(config: ToolsConfig, options: ApprovalOptions) {
+    this.#config = config;
+    this.#options = options;
+  }
+
+  async authorize(request: ApprovalRequest): Promise<ApprovalDecision> {
+    if (request.kind === "shell") return this.#authorizeShell(request);
+    const mode = this.#config.approvals.write;
+    if (mode === "deny") return { allowed: false, reason: "policy_denied" };
+    if (mode === "allow" || this.#options.assumeYes) return approved("policy_allowed");
+    return this.#ask(request);
+  }
+
+  async #authorizeShell(request: ApprovalRequest): Promise<ApprovalDecision> {
+    const command = request.command ?? "";
+    if (CONTROL_CHARACTERS.test(command)) return { allowed: false, reason: "control_characters" };
+    if (this.#config.blockedCommandPatterns.some((pattern) => new RegExp(pattern, "u").test(command))) {
+      return { allowed: false, reason: "blocked_command" };
+    }
+    const safePrefix = this.#config.safeCommandPrefixes.some(
+      (prefix) => command === prefix || command.startsWith(`${prefix} `)
+    );
+    const mode = this.#config.approvals.shell;
+    if (mode === "deny") return { allowed: false, reason: "policy_denied" };
+    if (safePrefix && (mode === "allow" || this.#options.assumeYes)) {
+      return approved("safe_prefix");
+    }
+    if (mode === "allow" && !safePrefix) {
+      return { allowed: false, reason: "not_allowlisted" };
+    }
+    return this.#ask(request);
+  }
+
+  async #ask(request: ApprovalRequest): Promise<ApprovalDecision> {
+    if (!this.#options.interactive || !this.#options.prompt) {
+      return { allowed: false, reason: "approval_required" };
+    }
+    return (await this.#options.prompt(request))
+      ? approved("user_approved")
+      : { allowed: false, reason: "user_denied" };
+  }
+}
