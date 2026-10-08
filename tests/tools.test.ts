@@ -9,6 +9,34 @@ import { toolDefinitions } from "../src/tools/definitions.js";
 import { ToolExecutor } from "../src/tools/executor.js";
 import { PathPolicy } from "../src/tools/path-policy.js";
 import { testConfig } from "./fixtures.js";
+import { validateRouteOverride } from "../src/router/override.js";
+import { resolveRoute } from "../src/router/resolve.js";
+import { EffectBarrier } from "../src/core/effect-barrier.js";
+
+test.each(["write_file", "run_command"])("an overridden %s route still asks approval and late approval cannot begin an effect", async (name) => {
+  const root = await workspace();
+  const config = testConfig();
+  config.tools.maxPolicy = "shell";
+  const route = resolveRoute({ errors: {} }, config, false, validateRouteOverride({ toolPolicy: "shell" }, config));
+  let allow!: (value: boolean) => void;
+  let requested!: () => void;
+  const waiting = new Promise<void>((resolve) => { requested = resolve; });
+  const approval = new Promise<boolean>((resolve) => { allow = resolve; });
+  const executor = await ToolExecutor.create(config, root, { interactive: true, prompt: async () => { requested(); return approval; } });
+  const controller = new AbortController();
+  const marker = "override-marker.txt";
+  const args = name === "write_file" ? { path: marker, content: "private" } : { command: `node -e "require('fs').writeFileSync('${marker}', 'private')"` };
+  const barrier = new EffectBarrier();
+  const execution = executor.execute(call(name, args), { policy: route.toolPolicy, signal: controller.signal });
+  barrier.track(execution);
+  await waiting;
+  await expect(readFile(join(root, marker), "utf8")).rejects.toThrow();
+  controller.abort();
+  allow(true);
+  await expect(execution).resolves.toMatchObject({ ok: false, code: "ABORTED" });
+  await barrier.settle();
+  await expect(readFile(join(root, marker), "utf8")).rejects.toThrow();
+});
 
 async function workspace() {
   const root = await mkdtemp(join(tmpdir(), "jevh-workspace-"));

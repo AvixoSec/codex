@@ -7,6 +7,109 @@ import type { DecisionClient } from "../src/router/jev-client.js";
 import type { RawRouteDecision } from "../src/router/resolve.js";
 import type { ToolExecutionContext, ToolExecutionResult } from "../src/tools/executor.js";
 import { testConfig } from "./fixtures.js";
+import { validateRouteOverride, type RouteOverride } from "../src/router/override.js";
+import type { RunnerTelemetryEvent } from "../src/core/telemetry.js";
+import { EffectBarrier } from "../src/core/effect-barrier.js";
+
+test.each([false, true])("a deferred read-only executor keeps legacy cancellation behavior (barrier %s)", async (withBarrier) => {
+  let begin!: () => void;
+  const started = new Promise<void>((resolve) => { begin = resolve; });
+  let release!: (value: ToolExecutionResult) => void;
+  const effect = new Promise<ToolExecutionResult>((resolve) => { release = resolve; });
+  const barrier = new EffectBarrier();
+  const track = vi.spyOn(barrier, "track");
+  const runner = new HarnessRunner(testConfig(), { decisionClient: new QueueDecisionClient([decision()]), workerClient: new QueueWorkerClient([result("", [{ id: "read", name: "read_file", arguments: { path: "x" } }])]), toolExecutor: { execute: () => { begin(); return effect; } } });
+  const controller = new AbortController();
+  const run = runner.run({ goal: "x", signal: controller.signal, ...(withBarrier ? { effectBarrier: barrier } : {}) });
+  await started;
+  controller.abort();
+  await expect(run).resolves.toMatchObject({ status: "failed", error: "Run aborted" });
+  expect(track).not.toHaveBeenCalled();
+  await barrier.settle();
+  release({ ok: true, content: "late" });
+});
+
+test("consumes exactly one future override with truthful real scores and provenance", async () => {
+  const f = makeRunner([decision(), decision({ action: "finish", complete: 0.9 })], [result("work")]);
+  let override: RouteOverride | undefined = validateRouteOverride({ action: "edit", effort: "medium" }, testConfig());
+  const telemetry: RunnerTelemetryEvent[] = [];
+  const outcome = await f.runner.run({ goal: "x", runId: "run_override", takeRouteOverride: () => { const value = override; override = undefined; return value; }, onTelemetry: (event) => { telemetry.push(event); } });
+  const routes = telemetry.filter((event) => event.type === "route_resolved");
+  expect(routes).toHaveLength(2);
+  expect(routes[0]!.data).toMatchObject({ action: "edit", effort: "medium", provenance: "user_override", scores: { action: 0.99, completion: 0 } });
+  expect(routes[1]!.data.provenance).toBe("jev");
+  expect(outcome.status).toBe("completed");
+});
+
+test("router failure plus finish override keeps scores null and still invokes a worker", async () => {
+  const f = makeRunner([new Error("router private"), decision({ action: "finish", complete: 0.9 })], [result("work")]);
+  let override: RouteOverride | undefined = validateRouteOverride({ action: "finish" }, testConfig());
+  const telemetry: RunnerTelemetryEvent[] = [];
+  const outcome = await f.runner.run({ goal: "x", runId: "run_override_failure", takeRouteOverride: () => { const value = override; override = undefined; return value; }, onTelemetry: (event) => { telemetry.push(event); } });
+  const route = telemetry.find((event) => event.type === "route_resolved")!;
+  expect(route.data.provenance).toBe("user_override");
+  expect(Object.values(route.data.scores)).toEqual(Array(8).fill(null));
+  expect(f.workerClient.inputs).toHaveLength(1);
+  expect(outcome.status).toBe("completed");
+});
+
+test("router failure plus finish override cannot complete from a synthetic zero at zero threshold", async () => {
+  const config = testConfig();
+  config.routing.completionThreshold = 0;
+  config.routing.maxSteps = 2;
+  const worker = new QueueWorkerClient([result("first"), result("second")]);
+  const router = new QueueDecisionClient([decision(), new Error("private")]);
+  const runner = new HarnessRunner(config, { decisionClient: router, workerClient: worker, toolExecutor: new FakeTools() });
+  const outcome = await runner.run({ goal: "x", takeRouteOverride: ({ step }) => step === 2 ? validateRouteOverride({ action: "finish" }, config) : undefined });
+  expect(outcome.status).toBe("limit");
+  expect(worker.inputs).toHaveLength(2);
+});
+
+test.each([false, true])("router failure after prior work never completes from fallback finish without a pending override (earlier override %s)", async (earlierOverride) => {
+  const config = testConfig();
+  config.routing.completionThreshold = 0;
+  config.routing.maxSteps = 2;
+  config.routing.fallback.action = "finish";
+  const worker = new QueueWorkerClient([result("first"), result("second")]);
+  const runner = new HarnessRunner(config, { decisionClient: new QueueDecisionClient([decision(), new Error("router-private")]), workerClient: worker, toolExecutor: new FakeTools() });
+  const telemetry: RunnerTelemetryEvent[] = [];
+  const outcome = await runner.run({ goal: "x", runId: "run_unscored_fallback", takeRouteOverride: ({ step }) => earlierOverride && step === 1 ? validateRouteOverride({ action: "edit" }, config) : undefined, onTelemetry: (event) => { telemetry.push(event); } });
+  expect(outcome.status).toBe("limit");
+  expect(worker.inputs).toHaveLength(2);
+  const routes = telemetry.filter((event) => event.type === "route_resolved");
+  expect(routes[0]!.data.provenance).toBe(earlierOverride ? "user_override" : "jev");
+  expect(routes[1]!.data).toMatchObject({ action: "finish", provenance: "fallback" });
+  expect(Object.values(routes[1]!.data.scores)).toEqual(Array(8).fill(null));
+});
+
+test("an actual real zero completion remains available and meets a zero threshold", async () => {
+  const config = testConfig();
+  config.routing.completionThreshold = 0;
+  const worker = new QueueWorkerClient([result("work")]);
+  const telemetry: RunnerTelemetryEvent[] = [];
+  const runner = new HarnessRunner(config, { decisionClient: new QueueDecisionClient([decision(), decision({ action: "finish", complete: 0 })]), workerClient: worker, toolExecutor: new FakeTools() });
+  const outcome = await runner.run({ goal: "x", runId: "run_real_zero", onTelemetry: (event) => { telemetry.push(event); } });
+  expect(outcome.status).toBe("completed");
+  expect(worker.inputs).toHaveLength(1);
+  expect(telemetry.filter((event) => event.type === "route_resolved").at(-1)!.data.scores.completion).toBe(0);
+});
+
+test("finish override below threshold continues work until configured max steps", async () => {
+  const f = makeRunner([decision({ complete: 0.1 }), decision({ complete: 0.1 })], [result("first"), result("second")]);
+  const outcome = await f.runner.run({ goal: "x", runId: "run_finish_low", maxSteps: 2, takeRouteOverride: () => validateRouteOverride({ action: "finish" }, testConfig()) });
+  expect(f.workerClient.inputs).toHaveLength(2);
+  expect(outcome.status).toBe("limit");
+});
+
+test("route overrides cannot bypass the elapsed deadline", async () => {
+  const config = testConfig();
+  let time = 0;
+  const worker = new QueueWorkerClient([result("work")]);
+  const runner = new HarnessRunner(config, { decisionClient: { decide: async () => { time = config.routing.maxElapsedMs; return decision(); } }, workerClient: worker, toolExecutor: new FakeTools(), now: () => time });
+  const outcome = await runner.run({ goal: "x", takeRouteOverride: () => validateRouteOverride({ action: "finish" }, config) });
+  expect(outcome.status).toBe("limit");
+  expect(worker.inputs).toHaveLength(0);
+});
 
 function choice(value: string, confidence = 0.99) {
   return { value, confidence, probabilities: { [value]: 1 } };

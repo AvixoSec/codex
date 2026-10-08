@@ -4,8 +4,11 @@ import { buildContext } from "../context/budget.js";
 import type { WorkerClient, WorkerInput } from "../providers/worker-client.js";
 import type { DecisionClient } from "../router/jev-client.js";
 import { resolveRoute, type RawRouteDecision, type ResolvedRoute } from "../router/resolve.js";
+import type { NextRouteContext, RouteOverride } from "../router/override.js";
 import { toolDefinitions } from "../tools/definitions.js";
 import type { ToolExecutionContext, ToolExecutionResult } from "../tools/executor.js";
+import { isMutatingTool } from "../tools/executor.js";
+import type { EffectBarrier } from "./effect-barrier.js";
 import { isRunStoppedError, RunGuard } from "./run-guard.js";
 import { isValidRunId } from "./run-id.js";
 import { projectRouteDecision, publicError, publicText, PUBLIC_CONTENT_BYTES, PUBLIC_SUMMARY_BYTES } from "./public-projector.js";
@@ -50,6 +53,8 @@ export interface RunOptions {
   askUser?: (question: string, context?: RequestContext) => Promise<string>;
   onEvent?: (event: RunnerLifecycleEvent) => void | Promise<void>;
   onTelemetry?: OnTelemetry;
+  takeRouteOverride?: (context: NextRouteContext) => RouteOverride | undefined;
+  effectBarrier?: EffectBarrier;
 }
 
 export type RunStatus = "completed" | "needs_input" | "limit" | "failed";
@@ -77,7 +82,6 @@ function fallbackDecision(config: HarnessConfig): RawRouteDecision {
     maxOutputTokens: rawChoice(String(fallback.maxOutputTokens)),
     temperature: rawChoice(String(fallback.temperature)),
     toolPolicy: rawChoice(fallback.toolPolicy),
-    completionProbability: 0,
     errors: {}
   };
 }
@@ -289,7 +293,8 @@ export class HarnessRunner {
         }
 
         guard.checkpoint();
-        const route = resolveRoute(raw, this.#config, options.shadow ?? this.#config.routing.shadow);
+        const override = options.takeRouteOverride?.({ runId, step });
+        const route = resolveRoute(raw, this.#config, options.shadow ?? this.#config.routing.shadow, override);
         await record("route", step, {
           proposed: route.proposed,
           resolved: {
@@ -312,7 +317,7 @@ export class HarnessRunner {
           errors: raw.errors
         });
         await emit({ kind: "route", step, message: `${route.action} → ${route.target.id} · ${route.effort}`, route });
-        await telemetry("route_resolved", step, projectRouteDecision(route, proposal, route.shadow || proposal === undefined ? "fallback" : "jev", this.#secrets));
+        await telemetry("route_resolved", step, projectRouteDecision(route, proposal, override ? "user_override" : route.shadow || proposal === undefined ? "fallback" : "jev", this.#secrets));
         guard.checkpoint();
 
         if (route.complete && workerSteps > 0) return finish("completed");
@@ -394,14 +399,18 @@ export class HarnessRunner {
               activeTool = publicCall;
               await telemetry("tool_started", step, publicCall);
               try {
-                toolResult = sanitizeKnownSecrets(await guard.run(() => this.#toolExecutor.execute(call, {
-                  policy: route.toolPolicy,
-                  signal: guard.signal,
-                  runId,
-                  step,
-                  onTelemetry: sendTelemetry,
-                  publicText: text
-                })), this.#secrets);
+                toolResult = sanitizeKnownSecrets(await guard.run(() => {
+                  const execution = this.#toolExecutor.execute(call, {
+                    policy: route.toolPolicy,
+                    signal: guard.signal,
+                    runId,
+                    step,
+                    onTelemetry: sendTelemetry,
+                    publicText: text
+                  });
+                  if (isMutatingTool(call.name)) options.effectBarrier?.track(execution);
+                  return execution;
+                }), this.#secrets);
               } catch (error) {
                 if (isRunStoppedError(error)) throw error;
                 toolResult = {

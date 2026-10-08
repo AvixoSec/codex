@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from "vitest";
 import { JevHttpClient } from "../src/router/jev-client.js";
 import { buildQuestions } from "../src/router/questions.js";
 import { resolveRoute, type RawRouteDecision } from "../src/router/resolve.js";
+import { validateRouteOverride } from "../src/router/override.js";
 import { testConfig } from "./fixtures.js";
 
 function choice(value: string, confidence = 0.95) {
@@ -129,6 +130,47 @@ describe("Jev questions", () => {
 });
 
 describe("atomic route resolution", () => {
+  test.each([undefined, NaN, Infinity, -1, 2])("unavailable real completion never passes a zero threshold (%s)", (completionProbability) => {
+    const config = testConfig();
+    config.routing.completionThreshold = 0;
+    const route = resolveRoute(raw({ completionProbability }), config, false, validateRouteOverride({ action: "finish" }, config));
+    expect(route.complete).toBe(false);
+  });
+  test("override retains global tool ceiling and supported effort and temperature bounds", () => {
+    const config = testConfig();
+    config.routing.choices.temperatures.push(2);
+    const route = resolveRoute(raw(), config, false, validateRouteOverride({ target: "alpha/fast", effort: "xhigh", temperature: 2, toolPolicy: "shell" }, config));
+    expect(route.effort).toBe("medium");
+    expect(route.temperature).toBe(1);
+    expect(route.toolPolicy).toBe("write");
+    expect(route.adjustments).toContainEqual(expect.objectContaining({ field: "toolPolicy", reason: "global_tool_ceiling" }));
+  });
+
+  test.each([0.1, undefined, NaN, Infinity, -1, 2])("finish override cannot replace unavailable or low real completion score %s", (completionProbability) => {
+    const config = testConfig();
+    const route = resolveRoute(raw({ completionProbability }), config, false, validateRouteOverride({ action: "finish" }, config));
+    expect(route.action).toBe("finish");
+    expect(route.complete).toBe(false);
+  });
+
+  test("finish override uses the real Jev completion threshold", () => {
+    const config = testConfig();
+    expect(resolveRoute(raw({ completionProbability: 0.91 }), config, false, validateRouteOverride({ action: "finish" }, config)).complete).toBe(true);
+  });
+  test("overrides only selected shadow coordinates before unchanged capability clamps", () => {
+    const config = testConfig();
+    const override = validateRouteOverride({ target: "beta/deep", effort: "xhigh", contextTokens: 32000, maxOutputTokens: 8000, temperature: 0.8, toolPolicy: "shell" }, config);
+    const route = resolveRoute(raw(), config, true, override);
+    expect(route.action).toBe("analyze");
+    expect(route.target.id).toBe("beta/deep");
+    expect(route.effort).toBe("high");
+    expect(route.maxOutputTokens).toBe(6000);
+    expect(route.contextTokens).toBe(5000);
+    expect(route.temperature).toBeUndefined();
+    expect(route.toolPolicy).toBe("none");
+    expect(route.proposed.target).toBe("beta/deep");
+    expect(route.confidences.target).toBe(0.95);
+  });
   test("resolves each coordinate against only the selected model capabilities", () => {
     const route = resolveRoute(raw(), testConfig());
 

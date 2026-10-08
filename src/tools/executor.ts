@@ -26,6 +26,10 @@ export interface ToolExecutionResult {
   metadata?: Record<string, unknown>;
 }
 
+export function isMutatingTool(name: string): boolean {
+  return name === "write_file" || name === "replace_in_file" || name === "run_command";
+}
+
 function stringArg(args: Record<string, unknown>, name: string): string {
   const value = args[name];
   if (typeof value !== "string") throw new Error(`${name} must be a string`);

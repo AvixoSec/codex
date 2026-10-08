@@ -1,5 +1,6 @@
 import { EFFORTS, TOOL_POLICIES, type Effort, type HarnessConfig, type RouteAction, type TargetDescriptor, type ToolPolicy } from "../core/types.js";
 import { listTargets } from "../config/schema.js";
+import type { RouteOverride } from "./override.js";
 
 export interface RawChoiceDecision {
   value: string;
@@ -126,12 +127,16 @@ function cappedToolPolicy(requested: ToolPolicy, ceiling: ToolPolicy): ToolPolic
   return TOOL_POLICIES[Math.min(requestedIndex, ceilingIndex)] ?? "none";
 }
 
-export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shadow = config.routing.shadow): ResolvedRoute {
+export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shadow = config.routing.shadow, override?: RouteOverride): ResolvedRoute {
   const adjustments: RouteAdjustment[] = [];
   const threshold = config.routing.confidenceThreshold;
   const fallback = config.routing.fallback;
   const targets = listTargets(config);
   const targetIds = targets.map((target) => target.id);
+  const select = (options: SelectOptions): string => {
+    const coordinate = override?.[options.field];
+    return coordinate !== undefined ? String(coordinate) : selectValue(options);
+  };
 
   const proposed: ProposedRoute = {
     action: raw.action?.value,
@@ -143,7 +148,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     toolPolicy: raw.toolPolicy?.value
   };
 
-  const selectedAction = selectValue({
+  const selectedAction = select({
     field: "action",
     raw: raw.action,
     offered: config.routing.choices.actions,
@@ -152,7 +157,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     shadow,
     adjustments
   }) as RouteAction;
-  const selectedTargetId = selectValue({
+  const selectedTargetId = select({
     field: "target",
     raw: raw.target,
     offered: targetIds,
@@ -166,7 +171,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     throw new Error(`Configured fallback target not found: ${selectedTargetId}`);
   }
 
-  const requestedEffort = selectValue({
+  const requestedEffort = select({
     field: "effort",
     raw: raw.effort,
     offered: config.routing.choices.efforts,
@@ -185,7 +190,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     });
   }
 
-  const selectedOutput = Number(selectValue({
+  const selectedOutput = Number(select({
     field: "maxOutputTokens",
     raw: raw.maxOutputTokens,
     offered: config.routing.choices.maxOutputTokens.map(String),
@@ -206,7 +211,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     });
   }
 
-  const selectedContext = Number(selectValue({
+  const selectedContext = Number(select({
     field: "contextTokens",
     raw: raw.contextTokens,
     offered: config.routing.choices.contextTokens.map(String),
@@ -226,7 +231,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     });
   }
 
-  const selectedTemperature = Number(selectValue({
+  const selectedTemperature = Number(select({
     field: "temperature",
     raw: raw.temperature,
     offered: config.routing.choices.temperatures.map(String),
@@ -256,7 +261,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     }
   }
 
-  const selectedPolicy = selectValue({
+  const selectedPolicy = select({
     field: "toolPolicy",
     raw: raw.toolPolicy,
     offered: config.routing.choices.toolPolicies,
@@ -284,13 +289,12 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     });
   }
 
-  const completionProbability =
+  const hasCompletionProbability =
     typeof raw.completionProbability === "number" &&
     Number.isFinite(raw.completionProbability) &&
     raw.completionProbability >= 0 &&
-    raw.completionProbability <= 1
-      ? raw.completionProbability
-      : 0;
+    raw.completionProbability <= 1;
+  const completionProbability = hasCompletionProbability ? raw.completionProbability! : 0;
 
   return {
     action: selectedAction,
@@ -303,7 +307,7 @@ export function resolveRoute(raw: RawRouteDecision, config: HarnessConfig, shado
     maxOutputTokens,
     temperature,
     toolPolicy,
-    complete: selectedAction === "finish" && completionProbability >= config.routing.completionThreshold,
+    complete: selectedAction === "finish" && hasCompletionProbability && completionProbability >= config.routing.completionThreshold,
     completionProbability,
     shadow,
     proposed,
