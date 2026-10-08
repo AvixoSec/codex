@@ -1,5 +1,5 @@
-import { config as loadDotEnv } from "dotenv";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
+import { loadProjectEnvironment, ProjectEnvironmentReadError } from "../config/environment.js";
 import { createInterface } from "node:readline/promises";
 
 import { loadConfig } from "../config/load.js";
@@ -46,12 +46,8 @@ async function ask(question: string): Promise<string> {
 
 export async function runHarnessTask(options: RunCommandOptions): Promise<RunResult> {
   const env = options.env ?? process.env;
-  loadDotEnv({
-    path: resolve(dirname(options.configPath), ".env"),
-    override: false,
-    processEnv: env,
-    quiet: true
-  });
+  try { await loadProjectEnvironment(options.configPath, env); }
+  catch (error) { if (!(error instanceof ProjectEnvironmentReadError)) throw error; }
   const { config } = await loadConfig(options.configPath);
   const workspace = resolve(options.workspace ?? process.cwd());
   const interactive = options.interactive ?? Boolean(process.stdin.isTTY && process.stderr.isTTY);

@@ -1,7 +1,7 @@
 import { access, constants } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 
-import { config as loadDotenv } from "dotenv";
+import { loadProjectEnvironment, ProjectEnvironmentReadError } from "../config/environment.js";
 
 import { loadConfig } from "../config/load.js";
 
@@ -32,12 +32,8 @@ export async function doctorProject(
   });
 
   const loaded = await loadConfig(path);
-  loadDotenv({
-    path: join(dirname(loaded.path), ".env"),
-    processEnv: env,
-    override: false,
-    quiet: true
-  });
+  try { await loadProjectEnvironment(loaded.path, env); }
+  catch (error) { if (!(error instanceof ProjectEnvironmentReadError)) throw error; }
   checks.push({ name: "Configuration", status: "pass", message: loaded.path });
   checks.push({ name: "Schema", status: "pass", message: "version " + loaded.config.version });
 

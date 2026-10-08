@@ -10,6 +10,7 @@ import { listModels } from "../src/commands/models.js";
 import { replayReceipts } from "../src/commands/replay.js";
 import { validateProject } from "../src/commands/validate.js";
 import type { RunResult } from "../src/core/runner.js";
+import { encodeManagedCredential } from "../src/config/dotenv.js";
 
 function capture() {
   let value = "";
@@ -20,6 +21,16 @@ function capture() {
 }
 
 describe("CLI commands", () => {
+  test("prints managed credential doctor JSON without values or markers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "task4-cli-doctor-")); const created = await initProject(directory);
+    const secret = "CLI_VALUE_SENTINEL\n\0ü";
+    await writeFile(join(directory, ".env"), "TYPESAFE_API_KEY=" + encodeManagedCredential(secret) + "\rOPENAI_API_KEY=" + encodeManagedCredential(secret));
+    const stdout = capture(); const stderr = capture(); const env: Record<string, string | undefined> = {};
+    const program = createProgram({ cwd: directory, env, stdout: stdout.stream, stderr: stderr.stream });
+    await program.parseAsync(["--config", created.configPath, "--json", "doctor"], { from: "user" });
+    expect(JSON.parse(stdout.value()).ok).toBe(true); expect(env.TYPESAFE_API_KEY).toBe(secret);
+    expect(stdout.value() + stderr.value()).not.toContain("SENTINEL"); expect(stdout.value()).not.toContain("JEVH_MANAGED");
+  });
   test("exposes a concise command surface in help", () => {
     const program = createProgram();
     const help = program.helpInformation();

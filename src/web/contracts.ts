@@ -1,4 +1,35 @@
 import type { PublicError, PublicRouteDecision, RunnerTelemetryEvent } from "../core/telemetry.js";
+import type { Effort, HarnessConfig, ToolName, ToolPolicy } from "../core/types.js";
+
+export interface WebConfigEditor {
+  version: 1;
+  jev: { apiKeyEnv: string; model: string; timeoutMs: number; retries: number };
+  routing: HarnessConfig["routing"];
+  providers: Record<string, {
+    baseUrl: string; api: "chat-completions" | "responses"; apiKeyEnv?: string;
+    timeoutMs: number; retries: number;
+    models: Record<string, {
+      model?: string; description: string; contextWindow: number; maxOutputTokens: number;
+      efforts: Effort[]; effortMap: Partial<Record<Effort, string>>; supportsTools: boolean;
+      temperature: false | { min: number; max: number };
+    }>;
+  }>;
+  tools: {
+    enabled: ToolName[]; maxPolicy: ToolPolicy; approvals: HarnessConfig["tools"]["approvals"];
+    maxFileBytes: number; maxOutputBytes: number; maxCommandTimeoutMs: number;
+  };
+}
+export interface WebConfigDocument { revision: string; config: WebConfigEditor }
+export interface WebConfigIssue { path: readonly (string | number)[]; code: string; message: string }
+export type WebConfigValidation = { valid: true; issues: readonly [] } | { valid: false; issues: readonly WebConfigIssue[] };
+export type WebCredentialRequirement = { kind: "jev" } | { kind: "provider"; providerId: string; usage: "api_key" | "header" };
+export interface WebCredentialStatus { name: string; requiredBy: readonly WebCredentialRequirement[]; present: boolean }
+export type WebReceiptSummary = WebRunSummary & { historical: true };
+export interface WebReceipt {
+  run: WebReceiptSummary; latestRoute: PublicRouteDecision | null; events: readonly WebJournalEvent[];
+  truncated: boolean; highWaterId: string; highWaterSequence: number;
+}
+export interface WebReceiptListQuery { limit?: number; beforeRunId?: string }
 
 export type WebManagerEventInput =
   | { runId: string; step: 0; type: "run_accepted"; data: { goal: string; maxSteps: number; shadow: boolean } }

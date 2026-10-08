@@ -7,6 +7,8 @@ import { describe, expect, test } from "vitest";
 
 import { runHarnessTask } from "../src/commands/run.js";
 import { testConfig } from "./fixtures.js";
+import { encodeManagedCredential } from "../src/config/dotenv.js";
+import { doctorProject } from "../src/commands/doctor.js";
 
 async function jsonBody(request: IncomingMessage): Promise<Record<string, any>> {
   const chunks: Buffer[] = [];
@@ -47,6 +49,62 @@ function choice(choiceValue: string) {
 }
 
 describe("HTTP end-to-end rerouting", () => {
+  test("continues run with supplied credentials when optional dotenv cannot be read", async () => {
+    let requests = 0; const secret = "OPTIONAL_SECRET_SENTINEL";
+    const server = await mockServer(async (request, response) => {
+      requests += 1; expect(request.headers.authorization).toBe("Bearer " + secret); const body = await jsonBody(request); expect(JSON.stringify(body)).not.toContain(secret);
+      response.end(JSON.stringify(request.url === "/jev" ? { answers: { action: choice("analyze"), target: choice("alpha/fast"), effort: choice("low"), context_tokens: choice("8000"), max_output_tokens: choice("1000"), temperature: choice("0.2"), tool_policy: choice("none"), is_complete: { type: "noul", noul: 0 } } } : { choices: [{ message: { content: "safe" } }] }));
+    });
+    try {
+      const root = await mkdtemp(join(tmpdir(), "task4-run-optional-")); const config = testConfig(); config.routing.maxSteps = 1; config.jev.endpoint = server.origin + "/jev"; config.providers.alpha!.baseUrl = server.origin;
+      const path = join(root, "config.yaml"); await writeFile(path, stringifyYaml(config)); const dotenvPath = join(root, ".env"); await mkdir(dotenvPath);
+      const env = { TEST_JEV_KEY: secret, ALPHA_KEY: secret, BETA_KEY: secret };
+      const result = await runHarnessTask({ configPath: path, workspace: root, goal: "safe", env, interactive: false });
+      expect(result).toMatchObject({ status: "limit", steps: 1, finalText: "safe" }); expect(requests).toBe(2); expect(env.TEST_JEV_KEY).toBe(secret);
+      const output = JSON.stringify(result); expect(output).not.toContain(dotenvPath); expect(output).not.toMatch(/EISDIR|EACCES|SENTINEL|Project environment/u);
+    } finally { await server.close(); }
+  });
+  test("keeps an inherited marker-looking value literal in run and doctor", async () => {
+    const literal = encodeManagedCredential("INHERITED_SENTINEL"); let requests = 0;
+    const server = await mockServer(async (request, response) => {
+      requests += 1; expect(request.headers.authorization).toBe("Bearer " + literal);
+      const body = await jsonBody(request); expect(JSON.stringify(body)).not.toContain(literal);
+      response.end(JSON.stringify(request.url === "/jev" ? { answers: { action: choice("analyze"), target: choice("alpha/fast"), effort: choice("low"), context_tokens: choice("8000"), max_output_tokens: choice("1000"), temperature: choice("0.2"), tool_policy: choice("none"), is_complete: { type: "noul", noul: 0 } } } : { choices: [{ message: { content: "safe" } }] }));
+    });
+    try {
+      const root = await mkdtemp(join(tmpdir(), "task4-inherited-")); const config = testConfig(); config.routing.maxSteps = 1; config.jev.endpoint = server.origin + "/jev"; config.providers.alpha!.baseUrl = server.origin;
+      const path = join(root, "config.yaml"); await writeFile(path, stringifyYaml(config)); await writeFile(join(root, ".env"), "TEST_JEV_KEY=" + encodeManagedCredential("file") + "\nALPHA_KEY=" + encodeManagedCredential("file"));
+      const env = { TEST_JEV_KEY: literal, ALPHA_KEY: literal, BETA_KEY: literal };
+      const result = await runHarnessTask({ configPath: path, workspace: root, goal: "safe", env, interactive: false });
+      const report = await doctorProject(path, env, root); expect(report.ok).toBe(true); expect(requests).toBe(2); expect(env.TEST_JEV_KEY).toBe(literal);
+      expect(JSON.stringify([result, report])).not.toContain(literal); expect(JSON.stringify([result, report])).not.toContain("INHERITED_SENTINEL");
+    } finally { await server.close(); }
+  });
+  test("passes decoded managed credentials to Jev and every provider without passing the marker", async () => {
+    const seen: string[] = []; let turn = 0;
+    const secret = "credential-ü-'\"=#-SENTINEL";
+    const jev = await mockServer(async (request, response) => {
+      seen.push(String(request.headers.authorization)); expect(request.headers.authorization).toBe("Bearer " + secret);
+      const body = await jsonBody(request); expect(JSON.stringify(body)).not.toContain("SENTINEL");
+      const target = turn++ === 0 ? "alpha/fast" : "beta/deep";
+      response.end(JSON.stringify({ answers: { action: choice("analyze"), target: choice(target), effort: choice("low"), context_tokens: choice("8000"), max_output_tokens: choice("1000"), temperature: choice("0.2"), tool_policy: choice("none"), is_complete: { type: "noul", noul: 0 } } }));
+    });
+    const provider = await mockServer(async (request, response) => {
+      seen.push(String(request.headers.authorization)); expect(request.headers.authorization).toBe("Bearer " + secret);
+      expect(request.headers["x-custom"]).toBe(secret); const body = await jsonBody(request);
+      expect(JSON.stringify(body)).not.toContain("SENTINEL");
+      response.end(JSON.stringify(request.url?.endsWith("responses") ? { output: [{ type: "message", content: [{ type: "output_text", text: "safe" }] }] } : { choices: [{ message: { content: "safe" } }] }));
+    });
+    try {
+      const root = await mkdtemp(join(tmpdir(), "task4-managed-http-")); const config = testConfig();
+      config.jev.endpoint = jev.origin; config.routing.maxSteps = 2;
+      for (const p of Object.values(config.providers)) { p.baseUrl = provider.origin; p.headersFromEnv = { "X-Custom": "HEADER_KEY" }; }
+      const path = join(root, "config.yaml"); await writeFile(path, stringifyYaml(config));
+      await writeFile(join(root, ".env"), ["TEST_JEV_KEY", "ALPHA_KEY", "BETA_KEY", "HEADER_KEY"].map((name) => name + "=" + encodeManagedCredential(secret)).join("\u2028"));
+      const result = await runHarnessTask({ configPath: path, workspace: root, goal: "safe goal", interactive: false, env: {} });
+      expect(result.steps).toBe(2); expect(seen).toHaveLength(4); expect(JSON.stringify(result)).not.toContain("SENTINEL"); expect(seen.join()).not.toContain("JEVH_MANAGED");
+    } finally { await Promise.all([jev.close(), provider.close()]); }
+  });
   test("Jev selects two base URLs and fresh atomic settings across semantic steps", async () => {
     const sequence: string[] = [];
     const jevBodies: Record<string, any>[] = [];

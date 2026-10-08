@@ -17,6 +17,10 @@ import { buildRouterSnapshot } from "./snapshot.js";
 import type { OnTelemetry, PublicErrorCode, RequestContext, RunnerTelemetryEvent } from "./telemetry.js";
 import type { AgentEvent, HarnessConfig, ToolCall, WorkerResult } from "./types.js";
 
+// Durable receipt codes: append only; ReceiptService mirrors these mappings.
+const RECEIPT_KINDS = ["run_started", "router_error", "route", "worker_error", "worker", "tool_intent", "tool_result", "user_input", "run_finished"] as const;
+const RECEIPT_STATUSES = ["completed", "needs_input", "limit", "failed"] as const;
+
 export interface ToolExecutorLike {
   execute(call: ToolCall, context: ToolExecutionContext): Promise<ToolExecutionResult>;
 }
@@ -195,18 +199,27 @@ export class HarnessRunner {
     const emit = async (event: RunnerLifecycleEvent) => {
       await options.onEvent?.(sanitizeKnownSecrets(event, this.#secrets));
     };
-    const record = async (kind: string, step: number, data: Record<string, unknown> = {}) => {
+    const record = async (kind: typeof RECEIPT_KINDS[number], step: number, data: Record<string, unknown> = {}, aborted = false) => {
       if (!this.#config.receipts.enabled || !this.#receipts) return;
       sequence += 1;
-      await this.#receipts.append(runId, sanitizeKnownSecrets({
+      // Top-level keys are hardcoded at trusted call sites. Sanitize each value
+      // independently, retaining full value/key redaction inside nested payloads.
+      const sanitized = Object.fromEntries(Object.entries(data).map(([key, value]) => [key, sanitizeKnownSecrets(value, this.#secrets)]));
+      const timestampMs = this.#now();
+      await this.#receipts.append(runId, {
+        ...sanitized,
         schemaVersion: 1,
         runId,
         sequence,
-        timestamp: new Date(this.#now()).toISOString(),
+        timestamp: new Date(timestampMs).toISOString(),
+        timestampMs,
         kind,
+        kindCode: RECEIPT_KINDS.indexOf(kind) + 1,
         step,
-        ...data
-      }, this.#secrets));
+        // ReceiptStore still redacts all strings, including enum literals.
+        ...(kind === "run_finished" ? { statusCode: RECEIPT_STATUSES.indexOf(data.status as RunStatus) + 1 } : {}),
+        ...(kind === "run_finished" && data.status === "failed" && aborted ? { aborted: true } : {})
+      });
     };
     const finish = async (status: RunStatus, error?: string, code?: PublicErrorCode): Promise<RunResult> => {
       const finalText = latestAssistantText(events);
@@ -231,7 +244,7 @@ export class HarnessRunner {
         activeTool = undefined;
       }
       await completeStep(code === "RUN_ABORTED" || code === "TIME_LIMIT" ? "stopped" : status === "failed" ? "failed" : "completed");
-      await record("run_finished", workerSteps, { status, finalText, error });
+      await record("run_finished", workerSteps, { status, finalText, error }, code === "RUN_ABORTED");
       await emit({ kind: "status", step: workerSteps, message: error ? `${status}: ${error}` : status });
       await telemetry("run_finished", workerSteps, { status, finalText: text(finalText), ...(code ? { error: publicError(code) } : {}) });
       return {
