@@ -92,6 +92,31 @@ describe("workspace path policy", () => {
 });
 
 describe("approvals and execution", () => {
+  test("reuses one minted approval request ID in prompt context and telemetry", async () => {
+    const root = await workspace();
+    const events: Array<{ type: string; data: { requestId?: string } }> = [];
+    let requestId: string | undefined;
+    const executor = await ToolExecutor.create(testConfig(), root, { interactive: true, prompt: async (request, context) => {
+      requestId = request.requestId;
+      expect(context).toMatchObject({ requestId, runId: "run_approval", step: 4 });
+      expect(events.at(-1)?.type).toBe("approval_requested");
+      return false;
+    } });
+    await expect(executor.execute(call("write_file", { path: "x.txt", content: "secret-content" }), { policy: "write", runId: "run_approval", step: 4, onTelemetry: async (event) => { events.push(event); } })).resolves.toMatchObject({ ok: false, code: "APPROVAL_DENIED" });
+    expect(requestId).toMatch(/^approval_/);
+    expect(events.map((event) => event.data.requestId)).toEqual([requestId, requestId]);
+    expect(JSON.stringify(events)).not.toContain("secret-content");
+  });
+
+  test("resolves an approval as denied when its prompt rejects without exposing internal text", async () => {
+    const events: Array<{ type: string; data: { requestId?: string; allowed?: boolean } }> = [];
+    const executor = await ToolExecutor.create(testConfig(), await workspace(), { interactive: true, prompt: async () => { throw new Error("private-prompt-error"); } });
+    const result = await executor.execute(call("write_file", { path: "x.txt", content: "x" }), { policy: "write", runId: "run_prompt", step: 1, onTelemetry: async (event) => { events.push(event); } });
+    expect(result).toMatchObject({ ok: false, code: "TOOL_ERROR" });
+    expect(events.map((event) => event.type)).toEqual(["approval_requested", "approval_resolved"]);
+    expect(events[1]?.data).toMatchObject({ requestId: events[0]?.data.requestId, allowed: false });
+    expect(JSON.stringify(events)).not.toContain("private-prompt-error");
+  });
   test("defaults noninteractive ask decisions to deny", async () => {
     const config = testConfig();
     const handler = new PolicyApprovalHandler(config.tools, { interactive: false });

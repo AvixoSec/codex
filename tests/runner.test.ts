@@ -103,7 +103,7 @@ function result(text = "", toolCalls: ToolCall[] = []): WorkerResult {
 function makeRunner(
   decisions: Array<RawRouteDecision | Error>,
   workers: Array<WorkerResult | Error>,
-  options: { secrets?: string[]; toolResult?: string } = {}
+  options: { secrets?: string[]; toolResult?: string; createRunId?: () => string } = {}
 ) {
   const decisionClient = new QueueDecisionClient(decisions);
   const workerClient = new QueueWorkerClient(workers);
@@ -115,7 +115,7 @@ function makeRunner(
     toolExecutor: tools,
     receipts,
     secrets: options.secrets,
-    createRunId: () => "run-test",
+    createRunId: options.createRunId ?? (() => "run-test"),
     now: (() => {
       let time = 1_000;
       return () => time += 10;
@@ -125,6 +125,85 @@ function makeRunner(
 }
 
 describe("HarnessRunner", () => {
+  test("uses a supplied run ID unchanged and rejects invalid IDs before effects", async () => {
+    const setup = makeRunner([decision()], [result("done")]);
+    const onEvent = vi.fn();
+    const onTelemetry = vi.fn();
+    for (const runId of ["run_", "../escape", "run_x\n", "run_" + "x".repeat(121)]) {
+      await expect(setup.runner.run({ goal: "Test", runId, onEvent, onTelemetry })).rejects.toThrow(/run ID/i);
+    }
+    expect(setup.decisionClient.snapshots).toEqual([]);
+    expect(setup.workerClient.inputs).toEqual([]);
+    expect(setup.tools.calls).toEqual([]);
+    expect(setup.receipts.records).toEqual([]);
+    expect(onEvent).not.toHaveBeenCalled();
+    expect(onTelemetry).not.toHaveBeenCalled();
+    const run = await setup.runner.run({ goal: "Test", runId: "run_supplied", maxSteps: 1 });
+    expect(run.runId).toBe("run_supplied");
+    expect(setup.receipts.records.every((record) => record.runId === "run_supplied")).toBe(true);
+  });
+
+  test("awaits telemetry in emission order", async () => {
+    const setup = makeRunner([decision()], [result("done")]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const seen: string[] = [];
+    const promise = setup.runner.run({ goal: "Test", runId: "run_awaited", maxSteps: 1, onTelemetry: async (event) => {
+      seen.push(event.type);
+      if (event.type === "run_started") await gate;
+    } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(seen).toEqual(["run_started"]);
+    expect(setup.decisionClient.snapshots).toEqual([]);
+    release();
+    await promise;
+    expect(seen).toEqual(["run_started", "step_started", "route_requested", "route_resolved", "worker_started", "worker_completed", "step_completed", "run_finished"]);
+  });
+
+  test("rejects the actual invalid generated ID before effects when telemetry is enabled", async () => {
+    for (const invalid of ["run-test", "../escape", "run_", "run_x\n", "run_" + "x".repeat(121)]) {
+      const createRunId = vi.fn(() => invalid);
+      const setup = makeRunner([decision()], [result("done")], { createRunId });
+      const onEvent = vi.fn();
+      const onTelemetry = vi.fn();
+      await expect(setup.runner.run({ goal: "Test", maxSteps: 1, onEvent, onTelemetry })).rejects.toThrow(/run ID/i);
+      expect(createRunId).toHaveBeenCalledTimes(1);
+      expect(setup.decisionClient.snapshots).toEqual([]);
+      expect(setup.workerClient.inputs).toEqual([]);
+      expect(setup.tools.calls).toEqual([]);
+      expect(setup.receipts.records).toEqual([]);
+      expect(onEvent).not.toHaveBeenCalled();
+      expect(onTelemetry).not.toHaveBeenCalled();
+    }
+  });
+
+  test("preserves the legacy injected ID without public telemetry", async () => {
+    const createRunId = vi.fn(() => "run-test");
+    const setup = makeRunner([decision()], [result("done")], { createRunId });
+    const run = await setup.runner.run({ goal: "Test", maxSteps: 1 });
+    expect(run.runId).toBe("run-test");
+    expect(createRunId).toHaveBeenCalledTimes(1);
+    expect(setup.receipts.records.every((record) => record.runId === "run-test")).toBe(true);
+  });
+
+  test("uses the one generated valid ID in receipts and public telemetry", async () => {
+    const createRunId = vi.fn(() => "run_generated");
+    const setup = makeRunner([decision()], [result("done")], { createRunId });
+    const ids: string[] = [];
+    const run = await setup.runner.run({ goal: "Test", maxSteps: 1, onTelemetry: (event) => { ids.push(event.runId); } });
+    expect(run.runId).toBe("run_generated");
+    expect(createRunId).toHaveBeenCalledTimes(1);
+    expect(ids.length).toBeGreaterThan(0);
+    expect(ids.every((id) => id === run.runId)).toBe(true);
+    expect(setup.receipts.records.every((record) => record.runId === run.runId)).toBe(true);
+  });
+
+  test("keeps legacy lifecycle callbacks compatible", async () => {
+    const setup = makeRunner([decision()], [result("done")]);
+    const seen: string[] = [];
+    await setup.runner.run({ goal: "Test", maxSteps: 1, onEvent: (event) => { seen.push(event.kind); } });
+    expect(seen).toEqual(["status", "route", "worker", "status"]);
+  });
   test("routes before every worker, crosses a tool boundary, and switches base/model settings", async () => {
     const setup = makeRunner([
       decision({ action: "inspect", target: "alpha/fast", effort: "low", context: 8_000, tools: "read" }),

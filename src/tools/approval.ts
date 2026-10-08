@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import type { ToolsConfig } from "../core/types.js";
+import type { RequestContext } from "../core/telemetry.js";
 
 export interface ApprovalRequest {
+  requestId?: string;
   kind: "write" | "shell";
   summary: string;
   exactAction: string;
@@ -18,11 +20,11 @@ export interface ApprovalDecision {
 export interface ApprovalOptions {
   interactive: boolean;
   assumeYes?: boolean;
-  prompt?: (request: ApprovalRequest) => Promise<boolean>;
+  prompt?: (request: ApprovalRequest, context?: RequestContext) => Promise<boolean>;
 }
 
 export interface ApprovalHandler {
-  authorize(request: ApprovalRequest): Promise<ApprovalDecision>;
+  authorize(request: ApprovalRequest, context?: RequestContext): Promise<ApprovalDecision>;
 }
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f\u001b\u202a-\u202e\u2066-\u2069]/u;
@@ -68,15 +70,15 @@ export class PolicyApprovalHandler implements ApprovalHandler {
     this.#options = options;
   }
 
-  async authorize(request: ApprovalRequest): Promise<ApprovalDecision> {
-    if (request.kind === "shell") return this.#authorizeShell(request);
+  async authorize(request: ApprovalRequest, context?: RequestContext): Promise<ApprovalDecision> {
+    if (request.kind === "shell") return this.#authorizeShell(request, context);
     const mode = this.#config.approvals.write;
     if (mode === "deny") return { allowed: false, reason: "policy_denied" };
     if (mode === "allow" || this.#options.assumeYes) return approved("policy_allowed");
-    return this.#ask(request);
+    return this.#ask(request, context);
   }
 
-  async #authorizeShell(request: ApprovalRequest): Promise<ApprovalDecision> {
+  async #authorizeShell(request: ApprovalRequest, context?: RequestContext): Promise<ApprovalDecision> {
     const command = request.command ?? "";
     if (CONTROL_CHARACTERS.test(command)) return { allowed: false, reason: "control_characters" };
     if (this.#config.blockedCommandPatterns.some((pattern) => new RegExp(pattern, "u").test(command))) {
@@ -93,14 +95,14 @@ export class PolicyApprovalHandler implements ApprovalHandler {
     if (mode === "allow" && !safePrefix) {
       return { allowed: false, reason: "not_allowlisted" };
     }
-    return this.#ask(request);
+    return this.#ask(request, context);
   }
 
-  async #ask(request: ApprovalRequest): Promise<ApprovalDecision> {
+  async #ask(request: ApprovalRequest, context?: RequestContext): Promise<ApprovalDecision> {
     if (!this.#options.interactive || !this.#options.prompt) {
       return { allowed: false, reason: "approval_required" };
     }
-    return (await this.#options.prompt(request))
+    return (await this.#options.prompt(request, context))
       ? approved("user_approved")
       : { allowed: false, reason: "user_denied" };
   }

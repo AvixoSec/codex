@@ -7,8 +7,11 @@ import { resolveRoute, type RawRouteDecision, type ResolvedRoute } from "../rout
 import { toolDefinitions } from "../tools/definitions.js";
 import type { ToolExecutionContext, ToolExecutionResult } from "../tools/executor.js";
 import { isRunStoppedError, RunGuard } from "./run-guard.js";
+import { isValidRunId } from "./run-id.js";
+import { projectRouteDecision, publicError, publicText, PUBLIC_CONTENT_BYTES, PUBLIC_SUMMARY_BYTES } from "./public-projector.js";
 import { sanitizeKnownSecrets, sanitizeString } from "./sanitize.js";
 import { buildRouterSnapshot } from "./snapshot.js";
+import type { OnTelemetry, PublicErrorCode, RequestContext, RunnerTelemetryEvent } from "./telemetry.js";
 import type { AgentEvent, HarnessConfig, ToolCall, WorkerResult } from "./types.js";
 
 export interface ToolExecutorLike {
@@ -40,11 +43,13 @@ export interface RunnerDependencies {
 
 export interface RunOptions {
   goal: string;
+  runId?: string;
   maxSteps?: number;
   shadow?: boolean;
   signal?: AbortSignal;
-  askUser?: (question: string) => Promise<string>;
+  askUser?: (question: string, context?: RequestContext) => Promise<string>;
   onEvent?: (event: RunnerLifecycleEvent) => void | Promise<void>;
+  onTelemetry?: OnTelemetry;
 }
 
 export type RunStatus = "completed" | "needs_input" | "limit" | "failed";
@@ -129,7 +134,9 @@ export class HarnessRunner {
   }
 
   async run(options: RunOptions): Promise<RunResult> {
-    const runId = this.#createRunId();
+    if (options.runId !== undefined && !isValidRunId(options.runId)) throw new Error("Invalid run ID");
+    const runId = options.runId ?? this.#createRunId();
+    if (options.onTelemetry && !isValidRunId(runId)) throw new Error("Invalid run ID");
     const startedAt = this.#now();
     const guard = new RunGuard({
       startedAt,
@@ -145,6 +152,41 @@ export class HarnessRunner {
     let workerSteps = 0;
     let routerFailures = 0;
     let providerFailures = 0;
+    let activeStep: number | undefined;
+    let activeWorker: string | undefined;
+    let activeTool: { callId: string; name: string } | undefined;
+    let telemetryTail = Promise.resolve();
+    let telemetryClosed = false;
+    const pendingApprovals = new Map<string, number>();
+    const pendingInputs = new Map<string, number>();
+
+    // The guard can race an executor that is awaiting an approval callback.
+    // Queue every source through one sink, and fence late executor resolutions.
+    const sendTelemetry: OnTelemetry = (event) => {
+      if (telemetryClosed) return telemetryTail;
+      if (event.type === "approval_requested") pendingApprovals.set(event.data.requestId, event.step);
+      if (event.type === "approval_resolved") {
+        if (!pendingApprovals.delete(event.data.requestId)) return telemetryTail;
+      }
+      if (event.type === "input_requested") pendingInputs.set(event.data.requestId, event.step);
+      if (event.type === "input_resolved") {
+        if (!pendingInputs.delete(event.data.requestId)) return telemetryTail;
+      }
+      if (event.type === "run_finished") telemetryClosed = true;
+      telemetryTail = telemetryTail.then(() => options.onTelemetry?.(event));
+      return telemetryTail;
+    };
+
+    const text = (value: string, limit = PUBLIC_CONTENT_BYTES) => publicText(value, limit, this.#secrets);
+    const telemetry = async <Type extends RunnerTelemetryEvent["type"]>(type: Type, step: number, data: Extract<RunnerTelemetryEvent, { type: Type }>["data"]) => {
+      await sendTelemetry({ runId, type, step, data } as RunnerTelemetryEvent);
+    };
+    const completeStep = async (status: "completed" | "failed" | "stopped") => {
+      if (activeStep === undefined) return;
+      const step = activeStep;
+      activeStep = undefined;
+      await telemetry("step_completed", step, { status });
+    };
 
     const emit = async (event: RunnerLifecycleEvent) => {
       await options.onEvent?.(sanitizeKnownSecrets(event, this.#secrets));
@@ -162,10 +204,32 @@ export class HarnessRunner {
         ...data
       }, this.#secrets));
     };
-    const finish = async (status: RunStatus, error?: string): Promise<RunResult> => {
+    const finish = async (status: RunStatus, error?: string, code?: PublicErrorCode): Promise<RunResult> => {
       const finalText = latestAssistantText(events);
+      for (const [requestId, step] of pendingApprovals) {
+        await telemetry("approval_resolved", step, { requestId, allowed: false });
+      }
+      if (status !== "needs_input") {
+        for (const [requestId, step] of pendingInputs) {
+          await telemetry("input_resolved", step, {
+            requestId,
+            outcome: code === "RUN_ABORTED" || code === "TIME_LIMIT" ? "cancelled" : "failed",
+            error: publicError(code ?? "RUN_FAILED")
+          });
+        }
+      }
+      if (activeWorker !== undefined) {
+        await telemetry("worker_failed", activeStep ?? workerSteps, { target: activeWorker, error: publicError(code ?? "RUN_FAILED") });
+        activeWorker = undefined;
+      }
+      if (activeTool !== undefined) {
+        await telemetry("tool_failed", activeStep ?? workerSteps, { callId: activeTool.callId, name: activeTool.name, error: publicError(code ?? "TOOL_FAILED") });
+        activeTool = undefined;
+      }
+      await completeStep(code === "RUN_ABORTED" || code === "TIME_LIMIT" ? "stopped" : status === "failed" ? "failed" : "completed");
       await record("run_finished", workerSteps, { status, finalText, error });
       await emit({ kind: "status", step: workerSteps, message: error ? `${status}: ${error}` : status });
+      await telemetry("run_finished", workerSteps, { status, finalText: text(finalText), ...(code ? { error: publicError(code) } : {}) });
       return {
         runId,
         status,
@@ -177,18 +241,21 @@ export class HarnessRunner {
     };
 
     const finishStopped = () => guard.kind === "deadline"
-      ? finish("limit", `Elapsed-time limit reached after ${guard.elapsedMs()}ms`)
-      : finish("failed", "Run aborted");
+      ? finish("limit", `Elapsed-time limit reached after ${guard.elapsedMs()}ms`, "TIME_LIMIT")
+      : finish("failed", "Run aborted", "RUN_ABORTED");
 
     try {
       guard.checkpoint();
       await record("run_started", 0, { goal, maxSteps, shadow: options.shadow ?? this.#config.routing.shadow });
       await emit({ kind: "status", step: 0, message: `run ${runId} started` });
+      await telemetry("run_started", 0, { goal: text(goal, PUBLIC_SUMMARY_BYTES), maxSteps, shadow: options.shadow ?? this.#config.routing.shadow });
 
       while (workerSteps < maxSteps) {
         guard.checkpoint();
         const elapsed = guard.elapsedMs();
         const step = workerSteps + 1;
+        activeStep = step;
+        await telemetry("step_started", step, {});
         const snapshot = buildRouterSnapshot({
           goal,
           events,
@@ -201,11 +268,14 @@ export class HarnessRunner {
         });
 
         let raw: RawRouteDecision;
+        let proposal: RawRouteDecision | undefined;
+        await telemetry("route_requested", step, {});
         try {
           raw = sanitizeKnownSecrets(
             await guard.run(() => this.#decisionClient.decide(snapshot, guard.signal)),
             this.#secrets
           );
+          proposal = raw;
           routerFailures = 0;
         } catch (error) {
           if (isRunStoppedError(error)) throw error;
@@ -213,7 +283,7 @@ export class HarnessRunner {
           const message = sanitizeString(error instanceof Error ? error.message : String(error), this.#secrets);
           await record("router_error", step, { error: message, consecutiveFailures: routerFailures });
           if (routerFailures >= this.#config.routing.maxConsecutiveRouterFailures) {
-            return finish("failed", `Router failed ${routerFailures} consecutive times: ${message}`);
+            return finish("failed", `Router failed ${routerFailures} consecutive times: ${message}`, "ROUTER_FAILED");
           }
           raw = fallbackDecision(this.#config);
         }
@@ -242,6 +312,7 @@ export class HarnessRunner {
           errors: raw.errors
         });
         await emit({ kind: "route", step, message: `${route.action} → ${route.target.id} · ${route.effort}`, route });
+        await telemetry("route_resolved", step, projectRouteDecision(route, proposal, route.shadow || proposal === undefined ? "fallback" : "jev", this.#secrets));
         guard.checkpoint();
 
         if (route.complete && workerSteps > 0) return finish("completed");
@@ -258,6 +329,8 @@ export class HarnessRunner {
 
         let worker: WorkerResult;
         workerSteps += 1;
+        activeWorker = text(route.target.id, PUBLIC_SUMMARY_BYTES);
+        await telemetry("worker_started", step, { target: activeWorker });
         try {
           worker = sanitizeKnownSecrets(
             await guard.run(() => this.#workerClient.execute(input)),
@@ -271,9 +344,12 @@ export class HarnessRunner {
           events.push({ type: "error", content: `Provider ${route.target.id} failed: ${message}`, step });
           await record("worker_error", step, { target: route.target.id, error: message, consecutiveFailures: providerFailures });
           await emit({ kind: "worker", step, message: `worker error: ${message}`, route });
+          await telemetry("worker_failed", step, { target: activeWorker, error: publicError("PROVIDER_FAILED") });
+          activeWorker = undefined;
           if (providerFailures >= this.#config.routing.maxProviderFailures) {
-            return finish("failed", `Provider failed ${providerFailures} consecutive times: ${message}`);
+            return finish("failed", `Provider failed ${providerFailures} consecutive times: ${message}`, "PROVIDER_FAILED");
           }
+          await completeStep("failed");
           continue;
         }
 
@@ -287,10 +363,14 @@ export class HarnessRunner {
           result: workerReceipt(worker)
         });
         await emit({ kind: "worker", step, message: worker.text || `${worker.toolCalls.length} tool call(s)`, route });
+        await telemetry("worker_completed", step, { target: activeWorker, content: text(worker.text) });
+        activeWorker = undefined;
         guard.checkpoint();
 
         const offeredToolNames = new Set(availableTools.map((tool) => tool.name));
         for (const call of worker.toolCalls) {
+          const publicCall = { callId: text(call.id, PUBLIC_SUMMARY_BYTES), name: text(call.name, PUBLIC_SUMMARY_BYTES) };
+          await telemetry("tool_requested", step, publicCall);
           events.push({ type: "tool_call", id: call.id, name: call.name, arguments: call.arguments, step });
           let toolResult: ToolExecutionResult;
           if (usedToolCallIds.has(call.id)) {
@@ -311,10 +391,16 @@ export class HarnessRunner {
                 policy: route.toolPolicy
               });
               guard.checkpoint();
+              activeTool = publicCall;
+              await telemetry("tool_started", step, publicCall);
               try {
                 toolResult = sanitizeKnownSecrets(await guard.run(() => this.#toolExecutor.execute(call, {
                   policy: route.toolPolicy,
-                  signal: guard.signal
+                  signal: guard.signal,
+                  runId,
+                  step,
+                  onTelemetry: sendTelemetry,
+                  publicText: text
                 })), this.#secrets);
               } catch (error) {
                 if (isRunStoppedError(error)) throw error;
@@ -340,20 +426,35 @@ export class HarnessRunner {
             result: toolResult
           });
           await emit({ kind: "tool", step, message: `${call.name}: ${toolResult.ok ? "ok" : toolResult.code ?? "failed"}`, route, toolCall: call, toolResult });
+          if (toolResult.ok) await telemetry("tool_completed", step, { callId: publicCall.callId, name: publicCall.name, content: text(toolResult.content) });
+          else await telemetry("tool_failed", step, { callId: publicCall.callId, name: publicCall.name, error: publicError(toolResult.code === "APPROVAL_DENIED" ? "APPROVAL_DENIED" : "TOOL_FAILED") });
+          activeTool = undefined;
           guard.checkpoint();
         }
 
         if (route.action === "ask_user") {
           const question = worker.text || "The agent requires additional input.";
+          const requestId = `input_${randomUUID()}`;
+          await telemetry("input_requested", step, { requestId, question: text(question, PUBLIC_SUMMARY_BYTES) });
           if (!options.askUser) return finish("needs_input");
-          const answer = sanitizeString(await guard.run(() => options.askUser!(question)), this.#secrets);
+          let answer: string;
+          try {
+            answer = sanitizeString(await guard.run(() => options.askUser!(question, { requestId, runId, step, signal: guard.signal })), this.#secrets);
+          } catch (error) {
+            if (isRunStoppedError(error)) throw error;
+            await telemetry("input_resolved", step, { requestId, outcome: "failed", error: publicError("RUN_FAILED") });
+            await finish("failed", "Run failed.", "RUN_FAILED");
+            throw error;
+          }
           events.push({ type: "user_text", content: answer, step });
           await record("user_input", step, { question, answer });
           guard.checkpoint();
+          await telemetry("input_resolved", step, { requestId, outcome: "answered", answer: text(answer) });
         }
+        await completeStep("completed");
       }
 
-      return finish("limit", `Maximum semantic steps reached: ${maxSteps}`);
+      return finish("limit", `Maximum semantic steps reached: ${maxSteps}`, "STEP_LIMIT");
     } catch (error) {
       if (isRunStoppedError(error)) return finishStopped();
       throw error;

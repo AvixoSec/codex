@@ -4,13 +4,19 @@ import { dirname, relative } from "node:path";
 import { spawn } from "node:child_process";
 
 import { TOOL_POLICIES, type HarnessConfig, type ToolCall, type ToolPolicy } from "../core/types.js";
-import { type ApprovalOptions, PolicyApprovalHandler } from "./approval.js";
+import { publicText, PUBLIC_SUMMARY_BYTES } from "../core/public-projector.js";
+import type { OnTelemetry } from "../core/telemetry.js";
+import { type ApprovalOptions, type ApprovalRequest, PolicyApprovalHandler } from "./approval.js";
 import { toolDefinition } from "./definitions.js";
 import { PathPolicy } from "./path-policy.js";
 
 export interface ToolExecutionContext {
   policy: ToolPolicy;
   signal?: AbortSignal;
+  runId?: string;
+  step?: number;
+  onTelemetry?: OnTelemetry;
+  publicText?: (value: string, maxBytes: number) => string;
 }
 
 export interface ToolExecutionResult {
@@ -160,11 +166,11 @@ export class ToolExecutor {
         case "search_text":
           return await this.#searchText(call.arguments);
         case "write_file":
-          return await this.#writeFile(call.arguments, context.signal);
+          return await this.#writeFile(call.arguments, context);
         case "replace_in_file":
-          return await this.#replaceInFile(call.arguments, context.signal);
+          return await this.#replaceInFile(call.arguments, context);
         case "run_command":
-          return await this.#runCommand(call.arguments, context.signal);
+          return await this.#runCommand(call.arguments, context);
         default:
           return { ok: false, code: "UNKNOWN_TOOL", content: `Unknown tool: ${call.name}` };
       }
@@ -174,6 +180,26 @@ export class ToolExecutor {
         code: "TOOL_ERROR",
         content: error instanceof Error ? error.message : String(error)
       };
+    }
+  }
+
+  async #authorize(request: ApprovalRequest, context: ToolExecutionContext) {
+    const requestId = `approval_${randomUUID()}`;
+    request.requestId = requestId;
+    const emit = context.runId !== undefined && context.step !== undefined ? context.onTelemetry : undefined;
+    const runId = context.runId ?? "";
+    const step = context.step ?? 0;
+    const summary = request.kind === "shell" ? "Run command" : "Write or edit workspace file";
+    await emit?.({ runId, step, type: "approval_requested", data: { requestId, category: request.kind, summary: (context.publicText ?? publicText)(summary, PUBLIC_SUMMARY_BYTES) } });
+    let allowed = false;
+    try {
+      const approval = await abortable(() => this.#approval.authorize(request, context.runId !== undefined && context.step !== undefined
+        ? { requestId, runId, step, ...(context.signal ? { signal: context.signal } : {}) }
+        : undefined), context.signal);
+      allowed = approval !== ABORTED_OPERATION && approval.allowed;
+      return approval;
+    } finally {
+      await emit?.({ runId, step, type: "approval_resolved", data: { requestId, allowed } });
     }
   }
 
@@ -241,16 +267,17 @@ export class ToolExecutor {
     return { ok: true, content: truncateOutput(matches.join("\n"), this.#config.tools.maxOutputBytes), metadata: { count: matches.length } };
   }
 
-  async #writeFile(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolExecutionResult> {
+  async #writeFile(args: Record<string, unknown>, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    const signal = context.signal;
     const relativePath = stringArg(args, "path");
     const content = stringArg(args, "content");
     if (Buffer.byteLength(content, "utf8") > this.#config.tools.maxFileBytes) throw new Error("Content exceeds file byte limit");
     await this.#paths.writePath(relativePath);
-    const approval = await abortable(() => this.#approval.authorize({
+    const approval = await this.#authorize({
       kind: "write",
       summary: `Write ${relativePath}`,
       exactAction: `write_file:${relativePath}:sha256:${hash(content)}`
-    }), signal);
+    }, context);
     if (approval === ABORTED_OPERATION) return abortedResult();
     if (!approval.allowed) return { ok: false, code: "APPROVAL_DENIED", content: approval.reason };
     if (signal?.aborted) return abortedResult();
@@ -264,7 +291,8 @@ export class ToolExecutor {
     return { ok: true, content: `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${relativePath}`, metadata: { approvalId: approval.approvalId } };
   }
 
-  async #replaceInFile(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolExecutionResult> {
+  async #replaceInFile(args: Record<string, unknown>, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    const signal = context.signal;
     const relativePath = stringArg(args, "path");
     const oldText = stringArg(args, "oldText");
     const newText = stringArg(args, "newText");
@@ -277,11 +305,11 @@ export class ToolExecutor {
     if (occurrences > 1 && !replaceAll) throw new Error("oldText occurs more than once; set replaceAll explicitly");
     const next = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
     if (Buffer.byteLength(next, "utf8") > this.#config.tools.maxFileBytes) throw new Error("Result exceeds file byte limit");
-    const approval = await abortable(() => this.#approval.authorize({
+    const approval = await this.#authorize({
       kind: "write",
       summary: `Edit ${relativePath}`,
       exactAction: `replace_in_file:${relativePath}:${hash(oldText)}:${hash(newText)}:${replaceAll}`
-    }), signal);
+    }, context);
     if (approval === ABORTED_OPERATION) return abortedResult();
     if (!approval.allowed) return { ok: false, code: "APPROVAL_DENIED", content: approval.reason };
     if (signal?.aborted) return abortedResult();
@@ -302,16 +330,17 @@ export class ToolExecutor {
     return { ok: true, content: `Replaced ${replaceAll ? validatedOccurrences : 1} occurrence(s) in ${relativePath}`, metadata: { approvalId: approval.approvalId } };
   }
 
-  async #runCommand(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolExecutionResult> {
+  async #runCommand(args: Record<string, unknown>, context: ToolExecutionContext): Promise<ToolExecutionResult> {
+    const signal = context.signal;
     const command = stringArg(args, "command");
     const requestedTimeout = integerArg(args, "timeoutMs", this.#config.tools.maxCommandTimeoutMs);
     const timeoutMs = Math.min(requestedTimeout, this.#config.tools.maxCommandTimeoutMs);
-    const approval = await abortable(() => this.#approval.authorize({
+    const approval = await this.#authorize({
       kind: "shell",
       summary: `Run command: ${command.replace(/[\u0000-\u001f\u007f]/gu, "?")}`,
       exactAction: command,
       command
-    }), signal);
+    }, context);
     if (approval === ABORTED_OPERATION) return abortedResult();
     if (!approval.allowed) return { ok: false, code: "APPROVAL_DENIED", content: approval.reason };
     if (signal?.aborted) return abortedResult();
